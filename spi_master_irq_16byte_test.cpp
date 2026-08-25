@@ -290,21 +290,6 @@ static bool VerifyData(const uint8_t* received)
         if (received[i] != EXPECTED_DATA[i])
         {
             pass = false;
-
-            std::cerr
-                << "[VERIFY] FAIL at byte "
-                << i
-                << ": expected=0x"
-                << std::uppercase
-                << std::hex
-                << std::setw(2)
-                << std::setfill('0')
-                << static_cast<unsigned int>(EXPECTED_DATA[i])
-                << " received=0x"
-                << std::setw(2)
-                << static_cast<unsigned int>(received[i])
-                << std::dec
-                << '\n';
         }
     }
 
@@ -535,12 +520,38 @@ int main()
     uint64_t pass_count = 0;
     uint64_t fail_count = 0;
 
+    uint64_t spi_error_count = 0;
     uint64_t sequence_error_count = 0;
     uint64_t missing_packet_count = 0;
     uint64_t duplicate_packet_count = 0;
+    uint64_t data_error_count = 0;
 
     uint16_t expected_sequence = 0U;
     bool have_sequence = false;
+
+    /*
+    * ------------------------------------------------------------
+    * Periodic statistics
+    * ------------------------------------------------------------
+    *
+    * Normal packet processing does NOT print to terminal.
+    *
+    * Statistics are printed once per second so that terminal I/O
+    * does not interfere with the 1 ms SPI test.
+    */
+    uint64_t last_report_spi_count = 0;
+    uint64_t last_report_spi_error_count = 0;
+    uint64_t last_report_pass_count = 0;
+    uint64_t last_report_data_error_count = 0;
+    uint64_t last_report_sequence_error_count = 0;
+    uint64_t last_report_missing_packet_count = 0;
+    uint64_t last_report_duplicate_packet_count = 0;
+
+    auto last_report_time =
+        std::chrono::steady_clock::now();
+
+    constexpr auto STAT_REPORT_INTERVAL =
+        std::chrono::seconds(1);
 
 
     /*
@@ -646,24 +657,6 @@ int main()
 
             gpiod_edge_event_buffer_free(event_buffer);
 
-            auto now =
-                std::chrono::system_clock::now();
-
-            auto time =
-                std::chrono::system_clock::to_time_t(now);
-
-            std::tm* local_time =
-                std::localtime(&time);
-
-            std::cout
-                << '\n'
-                << '['
-                << std::put_time(local_time, "%H:%M:%S")
-                << "] GPIO25 RISING"
-                << "  IRQ="
-                << irq_count
-                << '\n';
-
 
             /*
              * ------------------------------------------------
@@ -678,39 +671,19 @@ int main()
             uint8_t tx_dummy[TEST_DATA_SIZE]{};
             uint8_t rx_data[TEST_DATA_SIZE]{};
 
-
-            std::cout
-                << "[SPI] Starting Master transaction...\n";
-
-
             if (!spi.Transfer(
                     tx_dummy,
                     rx_data,
                     TEST_DATA_SIZE))
             {
+                ++spi_error_count;
                 ++fail_count;
-
-                std::cerr
-                    << "[SPI] Transfer FAILED\n";
 
                 continue;
             }
 
 
             ++spi_count;
-
-
-            /*
-             * ------------------------------------------------
-             * Display received data.
-             * ------------------------------------------------
-             */
-
-            std::cout
-                << "[SPI] RX data : "
-                << HexDump(rx_data, TEST_DATA_SIZE)
-                << '\n';
-
 
             /*
             * ------------------------------------------------
@@ -724,10 +697,6 @@ int main()
                 static_cast<uint16_t>(rx_data[0]) |
                 (static_cast<uint16_t>(rx_data[1]) << 8U);
 
-            std::cout
-                << "[SEQ] Received="
-                << received_sequence
-                << '\n';
 
             /*
             * ------------------------------------------------
@@ -779,15 +748,6 @@ int main()
 
                         missing_packet_count += missing;
 
-                        std::cerr
-                            << "[SEQ] MISSING "
-                            << missing
-                            << " packet(s)"
-                            << " expected="
-                            << expected_sequence
-                            << " received="
-                            << received_sequence
-                            << '\n';
 
                         /*
                         * Continue from the packet after the
@@ -806,13 +766,6 @@ int main()
                         */
                         ++duplicate_packet_count;
 
-                        std::cerr
-                            << "[SEQ] DUPLICATE / OUT-OF-ORDER"
-                            << " expected="
-                            << expected_sequence
-                            << " received="
-                            << received_sequence
-                            << '\n';
                     }
                 }
             }    
@@ -820,62 +773,109 @@ int main()
 
             const bool data_ok = VerifyData(rx_data);
 
+            if (!data_ok)
+            {
+                ++data_error_count;
+            }
+
             if (data_ok && sequence_ok)
             {
                 ++pass_count;
 
-                std::cout
-                    << "[VERIFY] PASS\n";
             }
             else
             {
                 ++fail_count;
 
-                std::cerr
-                    << "[VERIFY] FAIL";
-
-                if (!data_ok)
-                {
-                    std::cerr
-                        << " DATA";
-                }
-
-                if (!sequence_ok)
-                {
-                    std::cerr
-                        << " SEQUENCE";
-                }
-
-                std::cerr
-                    << '\n';
             }
 
-
             /*
-             * ------------------------------------------------
-             * Statistics
-             * ------------------------------------------------
-             */
+            * ------------------------------------------------------------
+            * Periodic statistics
+            * ------------------------------------------------------------
+            *
+            * Print statistics once per second.
+            *
+            * IMPORTANT:
+            *
+            * Do NOT print one line for every SPI transaction.
+            * The target test rate is 1 packet/ms = 1000 packets/sec.
+            *
+            * Excessive terminal output can affect userspace timing and
+            * make the test result less representative of the actual
+            * GPIO -> SPI path.
+            */
+            const auto report_now =
+                std::chrono::steady_clock::now();
 
-            std::cout
-                << "[STAT] IRQ="
-                << irq_count
-                << " SPI="
-                << spi_count
-                << " PASS="
-                << pass_count
-                << " FAIL="
-                << fail_count
-                << " SEQ_ERR="
-                << sequence_error_count
-                << " MISSING="
-                << missing_packet_count
-                << " DUP/OOO="
-                << duplicate_packet_count
-                << '\n';
+            if ((report_now - last_report_time) >=
+                STAT_REPORT_INTERVAL)
+            {
 
-            std::cout
-                << "Waiting for next STM32H755 PE3...\n";
+                const uint64_t rx_delta =
+                    spi_count - last_report_spi_count;
+
+                const uint64_t spi_error_delta =
+                    spi_error_count - last_report_spi_error_count;
+
+                const uint64_t ok_delta =
+                    pass_count - last_report_pass_count;
+
+                const uint64_t data_error_delta =
+                    data_error_count -
+                    last_report_data_error_count;
+
+                const uint64_t sequence_error_delta =
+                    sequence_error_count -
+                    last_report_sequence_error_count;
+
+                const uint64_t missing_delta =
+                    missing_packet_count -
+                    last_report_missing_packet_count;
+
+                const uint64_t duplicate_delta =
+                    duplicate_packet_count -
+                    last_report_duplicate_packet_count;
+
+
+                std::cout
+                    << "[1s] "
+                    << "RX=" << rx_delta
+                    << " OK=" << ok_delta
+                    << " SPI_ERR=" << spi_error_delta
+                    << " DATA_ERR=" << data_error_delta
+                    << " SEQ_ERR=" << sequence_error_delta
+                    << " LOST=" << missing_delta
+                    << " DUP=" << duplicate_delta
+                    << '\n';
+
+
+                last_report_spi_error_count =
+                    spi_error_count;
+
+                last_report_spi_count =
+                    spi_count;
+
+                last_report_pass_count =
+                    pass_count;
+
+                last_report_data_error_count =
+                    data_error_count;
+
+                last_report_sequence_error_count =
+                    sequence_error_count;
+
+                last_report_missing_packet_count =
+                    missing_packet_count;
+
+                last_report_duplicate_packet_count =
+                    duplicate_packet_count;
+
+
+                last_report_time =
+                    report_now;
+
+            }
         }
         catch (const std::exception& e)
         {

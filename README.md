@@ -1538,3 +1538,156 @@ cd ~/spi-master-test
 
 ![SPI_Connection_1](images/connection1.png)
 ![SPI_Connection_2](images/connection2.png)
+
+
+# 更新版本
+## [2026-08-25] 修改檔案 spi_master_irq_16byte_test.cpp
+### 修改原因： 因應 每 1ms 資料快速送到，必須移除不必要的列印資訊，只保留每一秒鐘統計資訊
+> 例如：
+
+每秒統計時會顯示：
+```bash
+[1s] RX=1000 OK=999 DATA_ERR=1 SEQ_ERR=0 LOST=0 DUP=0
+```
+
+意思是：
+
+- RX=1000：這 1 秒收到 1000 筆
+- OK=999：其中 999 筆「資料內容 + sequence」都正確
+- DATA_ERR=1：有 1 筆資料內容錯誤
+- SEQ_ERR=0：sequence 沒有中斷
+- LOST=0：沒有遺失封包
+- DUP=0：沒有 duplicate / out-of-order
+
+如果同一秒有 3 筆資料內容錯誤：
+
+```bash
+[1s] RX=1000 OK=997 DATA_ERR=3 SEQ_ERR=0 LOST=0 DUP=0
+```
+
+如果同一筆 packet 同時發生 data error + sequence error，則：
+
+```bash
+[1s] RX=1000 OK=998 DATA_ERR=1 SEQ_ERR=1 LOST=1 DUP=0
+```
+
+**最後會得到這種結果**
+
+正常
+
+```bash
+[1s] RX=1000 OK=1000 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+```
+
+SPI 傳輸失敗 2 次
+
+```bash
+[1s] RX=998 OK=998 SPI_ERR=2 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+```
+這代表：
+> STM32 通知了 1000 次，但只有 998 次 SPI transaction 成功。
+
+資料內容錯 1 次
+
+```bash
+[1s] RX=1000 OK=999 SPI_ERR=0 DATA_ERR=1 SEQ_ERR=0 LOST=0 DUP=0
+```
+代表：
+
+> SPI 都有成功，但有 1 個 packet 的資料內容錯誤。
+
+Sequence 遺失 2 個 packet
+
+```bash
+[1s] RX=998 OK=996 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=2 LOST=2 DUP=0
+```
+代表：
+
+> SPI 收到 998 筆，但 sequence 發現有 2 筆遺失。
+
+## 輸出結果
+```text
+編譯 ：
+
+herman@RPiCM5:~/spi-master-test $ g++ -std=c++17 -Wall -Wextra -O2 \
+    spi_master_irq_16byte_test.cpp \
+    -lgpiodcxx -lgpiod \
+    -o spi_master_irq_16byte_test
+
+執行 ： 
+herman@RPiCM5:~/spi-master-test $ ./spi_master_irq_16byte_test
+
+輸出 ：
+
+========================================
+CM5 SPI Master + GPIO25 Interrupt Test
+========================================
+GPIO chip : /dev/gpiochip0
+GPIO line : 25
+Edge      : RISING
+SPI device: /dev/spidev0.0
+SPI mode  : 0
+SPI speed : 1000000 Hz
+RX size   : 16 bytes
+========================================
+[SPI] Device       : /dev/spidev0.0
+[SPI] Mode         : 0
+[SPI] Bits         : 8
+[SPI] Speed        : 1000000 Hz
+[TEST] Expected RX : 00 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E
+========================================
+Waiting for STM32H755 PE3...
+========================================
+[1s] RX=1 OK=1 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+
+```
+持續很多秒都完全一致。
+
+這代表：
+
+
+| 項目       |     結果 | 意義                               |
+| -------- | -----: | -------------------------------- |
+| RX       | 1003/s | CM5 每秒完成約 1003 次 SPI transaction |
+| OK       | 1003/s | 每一筆 sequence + data 都正確          |
+| SPI_ERR  |      0 | 沒有 SPI transaction failure       |
+| DATA_ERR |      0 | 16 Byte 資料內容完全正確                 |
+| SEQ_ERR  |      0 | sequence 完全連續                    |
+| LOST     |      0 | 沒有遺失 packet                      |
+| DUP      |      0 | 沒有 duplicate / out-of-order      |
+
+**這是非常乾淨的結果。**
+
+
+
+
+
+
+
+
+
