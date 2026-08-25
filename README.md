@@ -1534,3 +1534,7 @@ cd ~/spi-master-test
 ./spi_master_irq_16byte_test
 ```
 
+# 硬體連接圖
+
+![SPI_Connection_1](images/connection1.png)
+![SPI_Connection_2](images/connection2.png)
