@@ -1,0 +1,33 @@
+# ============================================================
+# Build artifacts
+# ============================================================
+
+# Executable files
+spi_master_irq_16byte_test
+spi_master_16byte_test
+gpio25_interrupt_test
+
+# Generic executable files
+*.out
+
+# Object files
+*.o
+
+# Dependency files
+*.d
+
+# CMake build directory
+build/
+cmake-build-*/
+
+# Temporary files
+*.tmp
+*.log
+
+# Editor / IDE files
+.vscode/
+.idea/
+
+# Backup files
+*~
+*.bak
