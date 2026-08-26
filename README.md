@@ -1513,6 +1513,7 @@ g++ -std=c++17 -Wall -Wextra -O2 \
     -o spi_master_16byte_test
 ```
 
+**主要程式**
 ```bash
 cd ~/spi-master-test
 
@@ -1531,7 +1532,7 @@ cd ~/spi-master-test
 
 ./spi_master_16byte_test
 
-./spi_master_irq_16byte_test
+./spi_master_irq_16byte_test   <<< 主要程式
 ```
 
 # 硬體連接圖
@@ -1653,17 +1654,7 @@ Waiting for STM32H755 PE3...
 [1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
 [1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
 [1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
-[1s] RX=1003 OK=1003 SPI_ERR=0 DATA_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+
 
 ```
 持續很多秒都完全一致。
@@ -1683,11 +1674,625 @@ Waiting for STM32H755 PE3...
 
 **這是非常乾淨的結果。**
 
+---
+## [2026-08-25] 修改檔案 spi_master_irq_16byte_test.cpp
+### 修改原因： 接收來自 STM32H755 以 每 1ms 傳送 204 byte 資料封包
+- 移除不必要的列印資訊。
+- 移除 VerifyData 驗證資料是否正確等不必要的 function
+- 測試結果 ：
+```text
+編譯 ： 
+herman@RPiCM5:~/spi-master-test $ g++ -std=c++17 -Wall -Wextra -O2 \
+    spi_master_irq_16byte_test.cpp \
+    -lgpiodcxx -lgpiod \
+    -o spi_master_irq_16byte_test
+
+執行 ： 
+herman@RPiCM5:~/spi-master-test $ ./spi_master_irq_16byte_test
+
+輸出結果 ： 
+========================================
+CM5 SPI Master + GPIO25 Interrupt Test
+========================================
+GPIO chip : /dev/gpiochip0
+GPIO line : 25
+Edge      : RISING
+SPI device: /dev/spidev0.0
+SPI mode  : 0
+SPI speed : 1000000 Hz
+RX size   : 204 bytes
+========================================
+[SPI] Device       : /dev/spidev0.0
+[SPI] Mode         : 0
+[SPI] Bits         : 8
+[SPI] Speed        : 1000000 Hz
+========================================
+Waiting for STM32H755 PE3...
+========================================
+[1s] RX=1 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=576 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+
+```
+###  檢討
+- 目前沒有看到 SPI 封包遺失，也沒有 sequence 中斷。但是有一個非常重要的現象：時間上還來得及「接收」，但現在的 SPI clock 速度明顯不足以支撐 1 ms / 204 bytes。
+- 目前結果 ： CM5 每秒穩定得到：
+```text
+RX=576
+SPI_ERR=0
+SEQ_ERR=0
+LOST=0
+DUP=0
+```
+代表：
+
+* RX=576：每秒完成約 576 個 204-byte SPI transaction
+* SPI_ERR=0：沒有 SPI transfer error
+* SEQ_ERR=0：sequence 完全連續
+* LOST=0：沒有偵測到遺失 packet
+* DUP=0：沒有 duplicate / out-of-order
+
+> 所以就目前已經跑出的這一段而言： 資料沒有遺失，sequence 沒有中斷。
+
+---
+
+## 1. STM32 的「每 1 ms 一包」
+
+這是**資料產生週期**：
+
+```text
+每 1 ms
+   ↓
+產生一個 204-byte packet
+   ↓
+sequence +1
+```
+
+這是你 STM32H755 的 Timer / `HAL_GetTick()` 所決定的。
+
+---
+
+## 2. SPI 的 `1,000,000 Hz`
+
+這是**資料傳輸速度**，不是「每 1 ms 傳一次」。
+
+你現在：
+
+```cpp
+static constexpr uint32_t SPI_SPEED_HZ = 1000000U;
+```
+
+意思是：
+
+> SPI SCK 每秒振盪 1,000,000 次。
+
+SPI 每一個 clock 傳 1 bit，所以：
+
+```text
+1 MHz = 1,000,000 bits/sec
+```
+
+而你現在一包是：
+
+```text
+204 bytes × 8 = 1,632 bits
+```
+
+因此：
+
+```text
+1,632 bits ÷ 1,000,000 bits/sec
+≈ 1.632 ms
+```
+
+所以 **204 bytes 在 1 MHz 下，光 SPI clock 就需要約 1.632 ms 才傳得完。**
+
+---
+
+# 所以兩個 1 ms 是這樣的關係
+
+假設 STM32：
+
+```text
+0 ms     packet #0
+1 ms     packet #1
+2 ms     packet #2
+3 ms     packet #3
+```
+
+但是 CM5 SPI 只有 1 MHz：
+
+```text
+0 ms
+ └────── 1.632 ms ──────┘
+       packet #0
+
+1.632 ms
+ └────── 1.632 ms ──────┘
+       packet #1
+
+3.264 ms
+...
+```
+
+**CM5 的 SPI 傳輸速度追不上 STM32 每 1 ms 產生資料的速度。**
+
+---
+
+# 可以設定更高嗎？
+
+**可以，而且應該提高。**
+
+例如：
+
+### 2 MHz
+
+```text
+204 × 8 ÷ 2,000,000
+= 0.816 ms
+```
+
+已經小於 1 ms。
+
+### 4 MHz
+
+```text
+204 × 8 ÷ 4,000,000
+= 0.408 ms
+```
+
+### 8 MHz
+
+```text
+204 × 8 ÷ 8,000,000
+= 0.204 ms
+```
+
+所以：
+
+| SPI Speed | 204 bytes 理論傳輸時間 |
+| --------: | ---------------: |
+|     1 MHz |       1.632 ms ❌ |
+|     2 MHz |      0.816 ms ⚠️ |
+|     4 MHz |       0.408 ms ✅ |
+|     8 MHz |       0.204 ms ✅ |
+
+注意這是**純 SPI clock 傳輸時間**，實際還有 Linux、GPIO event、`ioctl()` 等 overhead。
+
+---
+
+## 我建議我們現在怎麼做？
+
+你現在的：
+
+```cpp
+static constexpr uint32_t SPI_SPEED_HZ = 1000000U;
+```
+
+**先不要丟掉，因為它是很好的 baseline。**
+
+我們已經得到：
+
+```text
+1 MHz
+RX=576
+SPI_ERR=0
+SEQ_ERR=0
+LOST=0
+DUP=0
+```
+
+接下來我建議直接測：
+
+```cpp
+static constexpr uint32_t SPI_SPEED_HZ = 4000000U;
+```
+
+也就是 **4 MHz**。
+
+然後重新跑同一個測試。
+
+我們最想看到的是：
+
+```text
+[1s] RX=??? SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+```
+
+如果接近：
+
+```text
+RX ≈ 1000
+```
+
+而且：
+
+```text
+SPI_ERR=0
+SEQ_ERR=0
+LOST=0
+DUP=0
+```
+
+那就代表 **SPI bandwidth 已經足夠，接下來才真正值得追查 STM32 的 1 ms timing 與 blocking 問題。**
+
+所以答案很簡單：
+
+> **SPI speed 跟 1 ms 有關，但它不是「1 ms 定時器」。它決定的是 204 bytes 能不能在這 1 ms 的時間窗口內傳完。**
+
+而且**4 MHz 是我們現在非常合理的下一個測試點。**
 
 
+---
+原設定數值
+static constexpr uint32_t SPI_SPEED_HZ = 1000000U;
+修改設定數值
+static constexpr uint32_t SPI_SPEED_HZ = 4000000U;
 
+更改成 4MHz 之後
+輸出結果：
 
+```text
+herman@RPiCM5:~/spi-master-test $ ./spi_master_irq_16byte_test
+========================================
+CM5 SPI Master + GPIO25 Interrupt Test
+========================================
+GPIO chip : /dev/gpiochip0
+GPIO line : 25
+Edge      : RISING
+SPI device: /dev/spidev0.0
+SPI mode  : 0
+SPI speed : 4000000 Hz
+RX size   : 204 bytes
+========================================
+[SPI] Device       : /dev/spidev0.0
+[SPI] Mode         : 0
+[SPI] Bits         : 8
+[SPI] Speed        : 4000000 Hz
+========================================
+Waiting for STM32H755 PE3...
+========================================
+[1s] RX=3 SPI_ERR=0 SEQ_ERR=3 LOST=0 DUP=3
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
+[1s] RX=2 SPI_ERR=0 SEQ_ERR=2 LOST=0 DUP=2
 
+```
+**這個情況很不對**
 
+**這個結果非常不對，而且它告訴我們一個很重要的事情：現在已經不是單純的「1 MHz 太慢」問題。**
 
+先不要改 STM32，也不要急著改 CM5 程式。先解讀這個結果。
 
+### 目前最重要的現象
+
+4 MHz、204 bytes 理論 SPI wire time：
+
+**約 0.408 ms**
+
+所以從純粹 SPI 頻寬來看，1 ms 週期是足夠的。
+
+但是實際卻變成：
+
+```text
+[1s] RX=3  SPI_ERR=0  SEQ_ERR=3  LOST=0  DUP=3
+[1s] RX=2  SPI_ERR=0  SEQ_ERR=2  LOST=0  DUP=2
+[1s] RX=2  SPI_ERR=0  SEQ_ERR=2  LOST=0  DUP=2
+...
+```
+
+也就是 **CM5 每秒只真正完成 2～3 次 SPI transaction**。
+
+這與：
+
+```text
+1 MHz → RX=576
+4 MHz → RX=2
+```
+
+完全不是正常的比例關係。
+
+---
+
+## 我現在最懷疑的是「STM32 PE3 的觸發方式」
+
+注意我們的架構：
+
+```text
+STM32
+  │
+  │ 每 1 ms
+  ▼
+PE3 HIGH
+  │
+  ▼
+CM5 GPIO25 Rising Event
+  │
+  ▼
+userspace 被喚醒
+  │
+  ▼
+SPI 204 bytes
+```
+
+問題是：
+
+**PE3 如果只是 HIGH 一下，然後很快又 LOW，再每 1 ms HIGH 一次，CM5 userspace 不一定能按照「一個 HIGH = 一個 SPI transaction」完整處理。**
+
+而現在 4 MHz SPI transaction 本身只需要約 0.408 ms。
+
+所以理論上應該可以。
+
+但是我們現在看到的是：
+
+```text
+RX ≈ 2/s
+```
+
+這已經不是 SPI 傳輸時間能解釋的。
+
+---
+
+## 還有一個非常關鍵的線索：`DUP`
+
+你現在看到：
+
+```text
+RX=2
+SEQ_ERR=2
+DUP=2
+```
+
+這代表：
+
+**CM5 確實讀到了 SPI 資料，但是讀到的 sequence 並不是我們預期的下一個 sequence。**
+
+而且 `LOST=0`。
+
+這個組合非常值得注意。
+
+如果 STM32 正常：
+
+```text
+100
+101
+102
+103
+104
+...
+```
+
+CM5 應該看到：
+
+```text
+100 → 101 → 102 → 103
+```
+
+如果 CM5 漏掉：
+
+```text
+100
+102
+103
+```
+
+就會：
+
+```text
+SEQ_ERR > 0
+LOST = 1
+```
+
+但現在：
+
+```text
+SEQ_ERR > 0
+LOST = 0
+DUP > 0
+```
+
+比較像是：
+
+```text
+100
+100
+100
+```
+
+或者：
+
+```text
+100
+99
+100
+```
+
+也就是 **STM32 端提供給 SPI Slave 的資料/sequence 更新，與 PE3 notification 的時序沒有對上。**
+
+---
+
+# 但現在先不要下結論
+
+這次測試反而非常有價值。
+
+我們現在已經知道：
+
+### 1 MHz
+
+```text
+204 bytes
+SPI wire time ≈ 1.632 ms
+
+RX ≈ 576/s
+```
+
+這個結果合理。
+
+### 4 MHz
+
+```text
+204 bytes
+SPI wire time ≈ 0.408 ms
+
+RX ≈ 2/s
+```
+
+**這個結果完全不合理。**
+
+所以現在不能再用：
+
+> 「STM32 每 1 ms 不準」
+
+來解釋全部問題。
+
+因為如果只是 STM32 timer 不準，應該仍然看到幾百甚至接近 1000 次，而不是突然掉到 2 次。
+
+---
+
+# 我建議現在立刻做一個非常小的確認
+
+**不要修改程式。**
+
+先把 STM32H755 的程式貼給我目前正在執行的完整：
+
+```c
+SPI2_Slave_SendPacket()
+```
+
+以及：
+
+```c
+while (1)
+{
+    ...
+}
+```
+
+中目前 **204-byte packet + PE3** 的完整程式。
+
+尤其我要確認這幾件事情：
+
+```text
+1. 204-byte buffer 在哪裡更新
+2. sequence number 在哪裡更新
+3. SPI2_Slave_SendPacket() 做什麼
+4. PE3 什麼時候拉 HIGH
+5. PE3 什麼時候拉 LOW
+6. SPI2 CS 是誰控制
+7. SPI2_Slave_SendPacket() 是否 blocking
+8. 每 1 ms 到底是誰決定的
+```
+
+**先不要修改任何東西。**
+
+你現在這個 `4 MHz → RX=2` 的結果，很可能讓我們抓到目前 STM32 **「資料更新 / PE3 / SPI transaction」三者時序上的真正問題**。
+
+而且你剛才的目標是今天下班前完成 **204 bytes / 1 ms 壓力測試**；我認為這個方向還來得及，不需要現在收尾。
+
+---
+## [2026-08-26] 修改檔案 spi_master_irq_16byte_test.cpp
+### 修改原因： 調整 CM5 SPI_SPEED_HZ = 2000000U; 
+**變更 SPI Clock 為 2MHz**
+
+輸出結果 ：
+
+```text
+編譯 ： 
+herman@RPiCM5:~/spi-master-test $ g++ -std=c++17 -Wall -Wextra -O2 \
+    spi_master_irq_16byte_test.cpp \
+    -lgpiodcxx -lgpiod \
+    -o spi_master_irq_16byte_test
+
+執行 ：
+herman@RPiCM5:~/spi-master-test $ ./spi_master_irq_16byte_test
+
+輸出結果 ： 
+========================================
+CM5 SPI Master + GPIO25 Interrupt Test
+========================================
+GPIO chip : /dev/gpiochip0
+GPIO line : 25
+Edge      : RISING
+SPI device: /dev/spidev0.0
+SPI mode  : 0
+SPI speed : 2000000 Hz
+RX size   : 204 bytes
+========================================
+[SPI] Device       : /dev/spidev0.0
+[SPI] Mode         : 0
+[SPI] Bits         : 8
+[SPI] Speed        : 2000000 Hz
+========================================
+Waiting for STM32H755 PE3...
+========================================
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+[1s] RX=1003 SPI_ERR=0 SEQ_ERR=0 LOST=0 DUP=0
+
+```
+> 從輸出結果可以看出 接收數 達到 理論 1000 / 1 sec，因為每 1ms 傳送 一次，1 秒 就應該傳送 1000 次。
+
+計算時間：
+
+```text
+204 × 8 / 2,000,000
+= 0.816 ms
+```
+所以：
+```text
+SPI transfer ≈ 0.816 ms
+```
+已經小於：
+```text
+STM32 packet period = 1 ms
+```
+因此：
+```text
+0.816 ms < 1 ms
+```
+理論上已經可以每 1 ms 完成一次 transaction。
+
+實際：
+```text
+RX ≈ 1003/s
+```
+而且：
+```text
+SPI_ERR=0
+SEQ_ERR=0
+LOST=0
+DUP=0
+```
+這是一個非常漂亮的結果。
+
+它證明目前這套架構：
+```text
+STM32
+  ↓
+204 bytes
+  ↓
+PE3
+  ↓
+CM5 GPIO25
+  ↓
+spidev
+  ↓
+204-byte SPI transaction
+```
+在 2 MHz 已經可以穩定跑到約 1000 packet/s。
+
+> 「目前這套 STM32H755 SPI2 Slave + PE3 notification + CM5 spidev 架構，已實驗證明 2 MHz 穩定可靠、2.2 MHz 也可靠，而 2.5 MHz 已出現 sequence integrity failure。因此目前應將 2 MHz 視為保守且可靠的工作頻率，不再以提高 SPI clock 作為目前的優化方向。」

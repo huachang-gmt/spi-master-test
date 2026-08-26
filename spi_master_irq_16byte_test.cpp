@@ -66,58 +66,11 @@ static constexpr uint8_t SPI_MODE = SPI_MODE_0;
  *
  * We can increase this later after the basic test passes.
  */
-static constexpr uint32_t SPI_SPEED_HZ = 1000000U;
+static constexpr uint32_t SPI_SPEED_HZ = 2000000U;  // 2000000U
 
 static constexpr uint8_t SPI_BITS_PER_WORD = 8U;
 
-static constexpr size_t TEST_DATA_SIZE = 16U;
-
-
-/*
- * Expected fixed payload.
- *
- * Byte 0-1 are reserved for the sequence number
- * and are NOT checked here.
- *
- * Byte 2-15 must remain fixed.
- */
-static const uint8_t EXPECTED_DATA[TEST_DATA_SIZE] =
-{
-    0x00, 0x00,
-    0x01, 0x02,
-    0x03, 0x04,
-    0x05, 0x06,
-    0x07, 0x08,
-    0x09, 0x0A,
-    0x0B, 0x0C,
-    0x0D, 0x0E
-};
-
-
-/* ------------------------------------------------------------
- * Utility
- * ------------------------------------------------------------ */
-
-static std::string HexDump(const uint8_t* data, size_t size)
-{
-    std::ostringstream oss;
-
-    for (size_t i = 0; i < size; ++i)
-    {
-        if (i != 0)
-        {
-            oss << ' ';
-        }
-
-        oss << std::uppercase
-            << std::hex
-            << std::setw(2)
-            << std::setfill('0')
-            << static_cast<unsigned int>(data[i]);
-    }
-
-    return oss.str();
-}
+static constexpr size_t TEST_DATA_SIZE = 204U;
 
 
 /* ------------------------------------------------------------
@@ -262,39 +215,6 @@ private:
 
     int fd_ = -1;
 };
-
-
-/* ------------------------------------------------------------
- * Verify
- * ------------------------------------------------------------ */
-
-static bool VerifyData(const uint8_t* received)
-{
-    bool pass = true;
-
-    /*
-     * Byte 0-1:
-     *
-     * Sequence number.
-     *
-     * These two bytes are verified separately.
-     */
-
-    /*
-     * Byte 2-15:
-     *
-     * Fixed test pattern.
-     */
-    for (size_t i = 2U; i < TEST_DATA_SIZE; ++i)
-    {
-        if (received[i] != EXPECTED_DATA[i])
-        {
-            pass = false;
-        }
-    }
-
-    return pass;
-}
 
 
 /* ------------------------------------------------------------
@@ -505,26 +425,17 @@ int main()
      */
 
     std::cout
-        << "[TEST] Expected RX : "
-        << HexDump(EXPECTED_DATA, TEST_DATA_SIZE)
-        << '\n';
-
-    std::cout
         << "========================================\n"
         << "Waiting for STM32H755 PE3...\n"
         << "========================================\n";
 
 
-    uint64_t irq_count = 0;
     uint64_t spi_count = 0;
-    uint64_t pass_count = 0;
-    uint64_t fail_count = 0;
 
     uint64_t spi_error_count = 0;
     uint64_t sequence_error_count = 0;
     uint64_t missing_packet_count = 0;
     uint64_t duplicate_packet_count = 0;
-    uint64_t data_error_count = 0;
 
     uint16_t expected_sequence = 0U;
     bool have_sequence = false;
@@ -541,8 +452,6 @@ int main()
     */
     uint64_t last_report_spi_count = 0;
     uint64_t last_report_spi_error_count = 0;
-    uint64_t last_report_pass_count = 0;
-    uint64_t last_report_data_error_count = 0;
     uint64_t last_report_sequence_error_count = 0;
     uint64_t last_report_missing_packet_count = 0;
     uint64_t last_report_duplicate_packet_count = 0;
@@ -584,8 +493,7 @@ int main()
             {
                 std::cerr
                     << "[GPIO] Failed while waiting for GPIO25 event\n";
-
-                ++fail_count;
+                
                 continue;
             }
 
@@ -602,7 +510,6 @@ int main()
                 std::cerr
                     << "[GPIO] Failed to allocate event buffer\n";
 
-                ++fail_count;
                 continue;
             }
 
@@ -619,7 +526,7 @@ int main()
                     << "[GPIO] Failed to read GPIO25 event\n";
 
                 gpiod_edge_event_buffer_free(event_buffer);
-                ++fail_count;
+                
                 continue;
             }
 
@@ -642,7 +549,7 @@ int main()
                     << "[GPIO] Invalid GPIO25 event\n";
 
                 gpiod_edge_event_buffer_free(event_buffer);
-                ++fail_count;
+                
                 continue;
             }
 
@@ -651,9 +558,7 @@ int main()
              * We requested RISING edge only,
              * therefore this event is the STM32 PE3
              * LOW -> HIGH notification.
-             */
-
-            ++irq_count;
+             */         
 
             gpiod_edge_event_buffer_free(event_buffer);
 
@@ -677,8 +582,7 @@ int main()
                     TEST_DATA_SIZE))
             {
                 ++spi_error_count;
-                ++fail_count;
-
+                
                 continue;
             }
 
@@ -704,8 +608,6 @@ int main()
             * ------------------------------------------------
             */
 
-            bool sequence_ok = true;
-
             if (!have_sequence)
             {
                 /*
@@ -729,8 +631,7 @@ int main()
                         static_cast<uint16_t>(expected_sequence + 1U);
                 }
                 else
-                {
-                    sequence_ok = false;
+                {                  
                     ++sequence_error_count;
 
                     /*
@@ -771,24 +672,6 @@ int main()
             }    
 
 
-            const bool data_ok = VerifyData(rx_data);
-
-            if (!data_ok)
-            {
-                ++data_error_count;
-            }
-
-            if (data_ok && sequence_ok)
-            {
-                ++pass_count;
-
-            }
-            else
-            {
-                ++fail_count;
-
-            }
-
             /*
             * ------------------------------------------------------------
             * Periodic statistics
@@ -818,13 +701,6 @@ int main()
                 const uint64_t spi_error_delta =
                     spi_error_count - last_report_spi_error_count;
 
-                const uint64_t ok_delta =
-                    pass_count - last_report_pass_count;
-
-                const uint64_t data_error_delta =
-                    data_error_count -
-                    last_report_data_error_count;
-
                 const uint64_t sequence_error_delta =
                     sequence_error_count -
                     last_report_sequence_error_count;
@@ -841,9 +717,7 @@ int main()
                 std::cout
                     << "[1s] "
                     << "RX=" << rx_delta
-                    << " OK=" << ok_delta
                     << " SPI_ERR=" << spi_error_delta
-                    << " DATA_ERR=" << data_error_delta
                     << " SEQ_ERR=" << sequence_error_delta
                     << " LOST=" << missing_delta
                     << " DUP=" << duplicate_delta
@@ -855,12 +729,6 @@ int main()
 
                 last_report_spi_count =
                     spi_count;
-
-                last_report_pass_count =
-                    pass_count;
-
-                last_report_data_error_count =
-                    data_error_count;
 
                 last_report_sequence_error_count =
                     sequence_error_count;
@@ -883,8 +751,7 @@ int main()
                 << "[ERROR] "
                 << e.what()
                 << '\n';
-
-            ++fail_count;
+            
         }
     }
 
