@@ -66,7 +66,7 @@ static constexpr uint8_t SPI_MODE = SPI_MODE_0;
  *
  * We can increase this later after the basic test passes.
  */
-static constexpr uint32_t SPI_SPEED_HZ = 2000000U;  // 2000000U
+static constexpr uint32_t SPI_SPEED_HZ = 12000000U;  // 10000000U / 8000000U / 4000000U / 2000000U  / 1500000U  /  1000000U
 
 static constexpr uint8_t SPI_BITS_PER_WORD = 8U;
 
