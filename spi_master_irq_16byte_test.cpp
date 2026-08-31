@@ -9,9 +9,11 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 #include <vector>
 
@@ -283,6 +285,7 @@ int main()
         << "SPI speed : " << SPI_SPEED_HZ << " Hz\n"
         << "RX size   : " << TEST_DATA_SIZE << " bytes\n"
         << "Log path  : " << LOG_DIRECTORY << '\n'
+        << "Exit      : Press 'q' to exit after the final complete packet is logged\n"
         << "========================================\n";
 
 
@@ -467,6 +470,49 @@ int main()
 
 
     /*
+     * ========================================================
+     * >>> Q EXIT SUPPORT <<<
+     *
+     * Pressing 'q' requests program termination.
+     *
+     * The program will NOT exit immediately.
+     *
+     * It must first receive one complete 204-byte packet
+     * and create both trajectory files.
+     * ========================================================
+     */
+
+    struct termios original_terminal{};
+    struct termios raw_terminal{};
+    bool terminal_modified = false;
+
+    if (isatty(STDIN_FILENO))
+    {
+        if (tcgetattr(STDIN_FILENO, &original_terminal) == 0)
+        {
+            raw_terminal = original_terminal;
+
+            raw_terminal.c_lflag &=
+                static_cast<unsigned int>(
+                    ~(ICANON | ECHO));
+
+            raw_terminal.c_cc[VMIN] = 0;
+            raw_terminal.c_cc[VTIME] = 0;
+
+            if (tcsetattr(
+                    STDIN_FILENO,
+                    TCSANOW,
+                    &raw_terminal) == 0)
+            {
+                terminal_modified = true;
+            }
+        }
+    }
+
+    bool exit_requested = false;
+
+
+    /*
      * --------------------------------------------------------
      * Trajectory buffer
      * --------------------------------------------------------
@@ -494,9 +540,6 @@ int main()
 
     /*
      * Start timing for the current trajectory.
-     *
-     * The first trajectory starts when the CM5 program
-     * reaches the event-processing stage.
      */
 
     auto trajectory_start_time =
@@ -530,11 +573,6 @@ int main()
      * ------------------------------------------------------------
      * Periodic statistics
      * ------------------------------------------------------------
-     *
-     * Normal packet processing does NOT print to terminal.
-     *
-     * Statistics are printed once per second so that terminal I/O
-     * does not interfere with the 1 ms SPI test.
      */
 
     uint64_t last_report_spi_count = 0;
@@ -551,11 +589,47 @@ int main()
 
 
     /*
+     * GPIO event file descriptor.
+     *
+     * poll() waits for either:
+     *
+     *   GPIO25 rising edge
+     *   stdin 'q'
+     */
+
+    const int gpio_fd =
+        gpiod_line_request_get_fd(gpio_request);
+
+    if (gpio_fd < 0)
+    {
+        std::cerr
+            << "[GPIO] Failed to get GPIO event file descriptor\n";
+
+        if (terminal_modified)
+        {
+            tcsetattr(
+                STDIN_FILENO,
+                TCSANOW,
+                &original_terminal);
+        }
+
+        gpiod_line_request_release(gpio_request);
+        gpiod_chip_close(gpio_chip);
+        return 1;
+    }
+
+
+    /*
      * --------------------------------------------------------
      * Main event loop
      * --------------------------------------------------------
      *
-     * NOTHING happens here until GPIO25 RISING.
+     * Wait for either:
+     *
+     *   GPIO25 RISING
+     *   keyboard 'q'
+     *
+     * GPIO25 remains the ONLY trigger for SPI transfer.
      * --------------------------------------------------------
      */
 
@@ -563,502 +637,540 @@ int main()
     {
         try
         {
+            struct pollfd poll_fds[2]{};
+
+            poll_fds[0].fd = gpio_fd;
+            poll_fds[0].events = POLLIN;
+
+            poll_fds[1].fd = STDIN_FILENO;
+            poll_fds[1].events = POLLIN;
+
             /*
-             * ------------------------------------------------
-             * Block until GPIO25 produces an edge event.
-             * ------------------------------------------------
-             *
-             * No GPIO polling.
-             *
-             * The program sleeps here until STM32 PE3
-             * changes LOW -> HIGH.
+             * Wait indefinitely for GPIO25 or keyboard input.
              */
 
-            if (gpiod_line_request_wait_edge_events(
-                    gpio_request,
-                    -1) < 0)
+            const int poll_result =
+                poll(
+                    poll_fds,
+                    2,
+                    -1);
+
+            if (poll_result < 0)
             {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+
                 std::cerr
-                    << "[GPIO] Failed while waiting for GPIO25 event\n";
+                    << "[POLL] Failed while waiting for event\n";
 
                 continue;
             }
-
-
-            /*
-             * Read the pending GPIO event.
-             */
-
-            gpiod_edge_event_buffer* event_buffer =
-                gpiod_edge_event_buffer_new(1);
-
-            if (event_buffer == nullptr)
-            {
-                std::cerr
-                    << "[GPIO] Failed to allocate event buffer\n";
-
-                continue;
-            }
-
-
-            int num_events =
-                gpiod_line_request_read_edge_events(
-                    gpio_request,
-                    event_buffer,
-                    1);
-
-            if (num_events < 0)
-            {
-                std::cerr
-                    << "[GPIO] Failed to read GPIO25 event\n";
-
-                gpiod_edge_event_buffer_free(event_buffer);
-
-                continue;
-            }
-
-
-            if (num_events == 0)
-            {
-                gpiod_edge_event_buffer_free(event_buffer);
-                continue;
-            }
-
-
-            const gpiod_edge_event* event =
-                gpiod_edge_event_buffer_get_event(
-                    event_buffer,
-                    0);
-
-            if (event == nullptr)
-            {
-                std::cerr
-                    << "[GPIO] Invalid GPIO25 event\n";
-
-                gpiod_edge_event_buffer_free(event_buffer);
-
-                continue;
-            }
-
-
-            /*
-             * We requested RISING edge only,
-             * therefore this event is the STM32 PE3
-             * LOW -> HIGH notification.
-             */
-
-            gpiod_edge_event_buffer_free(event_buffer);
 
 
             /*
              * ------------------------------------------------
-             * GPIO interrupt received.
-             *
-             * NOW and ONLY NOW:
-             *
-             * start SPI Master transaction.
+             * Check keyboard input.
              * ------------------------------------------------
              */
 
-            uint8_t tx_dummy[TEST_DATA_SIZE]{};
-            uint8_t rx_data[TEST_DATA_SIZE]{};
-
-            if (!spi.Transfer(
-                    tx_dummy,
-                    rx_data,
-                    TEST_DATA_SIZE))
+            if (poll_fds[1].revents & POLLIN)
             {
-                ++spi_error_count;
+                char input_char = '\0';
 
-                continue;
+                const ssize_t bytes_read =
+                    read(
+                        STDIN_FILENO,
+                        &input_char,
+                        1);
+
+                if (bytes_read == 1 &&
+                    (input_char == 'q' ||
+                     input_char == 'Q'))
+                {
+                    if (!exit_requested)
+                    {
+                        exit_requested = true;
+
+                        std::cout
+                            << "\n[EXIT] Exit requested. "
+                            << "Waiting for final complete packet...\n";
+                    }
+                }
             }
-
-
-            ++spi_count;
 
 
             /*
              * ------------------------------------------------
-             * Store complete 204-byte packet.
+             * GPIO25 event.
              * ------------------------------------------------
              *
-             * This is done only after the SPI transaction
-             * has completed successfully.
+             * If GPIO and 'q' arrive together, process GPIO
+             * first so that the complete packet is received.
              */
 
-            trajectory_buffer.insert(
-                trajectory_buffer.end(),
-                rx_data,
-                rx_data + TEST_DATA_SIZE);
-
-
-            /*
-             * ------------------------------------------------
-             * Extract 16-bit sequence number.
-             * ------------------------------------------------
-             *
-             * Byte 0 = LSB
-             * Byte 1 = MSB
-             */
-
-            const uint16_t received_sequence =
-                static_cast<uint16_t>(rx_data[0]) |
-                (static_cast<uint16_t>(rx_data[1]) << 8U);
-
-
-            /*
-             * ------------------------------------------------
-             * Sequence verification
-             * ------------------------------------------------
-             */
-
-            if (!have_sequence)
+            if (poll_fds[0].revents &
+                (POLLIN | POLLPRI))
             {
+                gpiod_edge_event_buffer* event_buffer =
+                    gpiod_edge_event_buffer_new(1);
+
+                if (event_buffer == nullptr)
+                {
+                    std::cerr
+                        << "[GPIO] Failed to allocate event buffer\n";
+
+                    continue;
+                }
+
+
+                const int num_events =
+                    gpiod_line_request_read_edge_events(
+                        gpio_request,
+                        event_buffer,
+                        1);
+
+                if (num_events < 0)
+                {
+                    std::cerr
+                        << "[GPIO] Failed to read GPIO25 event\n";
+
+                    gpiod_edge_event_buffer_free(event_buffer);
+
+                    continue;
+                }
+
+
+                if (num_events == 0)
+                {
+                    gpiod_edge_event_buffer_free(event_buffer);
+                    continue;
+                }
+
+
+                const gpiod_edge_event* event =
+                    gpiod_edge_event_buffer_get_event(
+                        event_buffer,
+                        0);
+
+                if (event == nullptr)
+                {
+                    std::cerr
+                        << "[GPIO] Invalid GPIO25 event\n";
+
+                    gpiod_edge_event_buffer_free(event_buffer);
+
+                    continue;
+                }
+
+
                 /*
-                 * First successfully received packet.
+                 * RISING edge:
                  *
-                 * Accept its sequence as the starting point.
+                 * STM32 PE3 LOW -> HIGH
                  */
 
-                expected_sequence =
-                    static_cast<uint16_t>(received_sequence + 1U);
+                gpiod_edge_event_buffer_free(event_buffer);
 
-                have_sequence = true;
-            }
-            else
-            {
-                if (received_sequence == expected_sequence)
+
+                /*
+                 * ------------------------------------------------
+                 * GPIO interrupt received.
+                 *
+                 * NOW and ONLY NOW:
+                 *
+                 * start SPI Master transaction.
+                 * ------------------------------------------------
+                 */
+
+                uint8_t tx_dummy[TEST_DATA_SIZE]{};
+                uint8_t rx_data[TEST_DATA_SIZE]{};
+
+                if (!spi.Transfer(
+                        tx_dummy,
+                        rx_data,
+                        TEST_DATA_SIZE))
                 {
-                    /*
-                     * Correct next packet.
-                     */
+                    ++spi_error_count;
 
+                    /*
+                     * If q was requested, an incomplete/failed
+                     * transfer is NOT sufficient for exit.
+                     */
+                    continue;
+                }
+
+
+                ++spi_count;
+
+
+                /*
+                 * ------------------------------------------------
+                 * Store complete 204-byte packet.
+                 * ------------------------------------------------
+                 */
+
+                trajectory_buffer.insert(
+                    trajectory_buffer.end(),
+                    rx_data,
+                    rx_data + TEST_DATA_SIZE);
+
+
+                /*
+                 * ------------------------------------------------
+                 * Extract 16-bit sequence number.
+                 * ------------------------------------------------
+                 */
+
+                const uint16_t received_sequence =
+                    static_cast<uint16_t>(rx_data[0]) |
+                    (static_cast<uint16_t>(rx_data[1]) << 8U);
+
+
+                /*
+                 * ------------------------------------------------
+                 * Sequence verification
+                 * ------------------------------------------------
+                 */
+
+                if (!have_sequence)
+                {
                     expected_sequence =
-                        static_cast<uint16_t>(expected_sequence + 1U);
+                        static_cast<uint16_t>(
+                            received_sequence + 1U);
+
+                    have_sequence = true;
                 }
                 else
                 {
-                    ++sequence_error_count;
-
-                    /*
-                     * Forward jump:
-                     *
-                     * received > expected
-                     *
-                     * means packets were skipped.
-                     */
-
-                    if (received_sequence > expected_sequence)
+                    if (received_sequence == expected_sequence)
                     {
-                        const uint16_t missing =
-                            static_cast<uint16_t>(
-                                received_sequence - expected_sequence);
-
-                        missing_packet_count += missing;
-
-
-                        /*
-                         * Continue from the packet after the
-                         * received sequence.
-                         */
-
                         expected_sequence =
                             static_cast<uint16_t>(
-                                received_sequence + 1U);
+                                expected_sequence + 1U);
                     }
                     else
                     {
-                        /*
-                         * received < expected.
-                         *
-                         * This may indicate duplicate or
-                         * out-of-order data.
-                         */
+                        ++sequence_error_count;
 
-                        ++duplicate_packet_count;
+                        if (received_sequence >
+                            expected_sequence)
+                        {
+                            const uint16_t missing =
+                                static_cast<uint16_t>(
+                                    received_sequence -
+                                    expected_sequence);
+
+                            missing_packet_count += missing;
+
+                            expected_sequence =
+                                static_cast<uint16_t>(
+                                    received_sequence + 1U);
+                        }
+                        else
+                        {
+                            ++duplicate_packet_count;
+                        }
                     }
                 }
-            }
-
-
-            /*
-             * ========================================================
-             * >>> TRAJECTORY COMPLETE CONDITION <<<
-             *
-             * CURRENT TEST:
-             *
-             *     4 seconds elapsed.
-             *
-             * FUTURE:
-             *
-             *     Replace ONLY this condition with DONE command
-             *     detection.
-             *
-             * IMPORTANT:
-             *
-             *     This check is performed AFTER the complete
-             *     204-byte SPI transaction and after the packet
-             *     has been stored.
-             * ========================================================
-             */
-
-            const auto trajectory_now =
-                std::chrono::steady_clock::now();
-
-            if ((trajectory_now - trajectory_start_time) >=
-                TRAJECTORY_INTERVAL)
-            {
-                /*
-                 * ------------------------------------------------
-                 * Create timestamp for archived trajectory file.
-                 * ------------------------------------------------
-                 */
-
-                const std::time_t current_time =
-                    std::time(nullptr);
-
-                std::tm local_time{};
-
-                if (localtime_r(
-                        &current_time,
-                        &local_time) == nullptr)
-                {
-                    std::cerr
-                        << "[LOG] Failed to get local time\n";
-
-                    continue;
-                }
-
-
-                std::ostringstream filename_stream;
-
-                filename_stream
-                    << LOG_DIRECTORY
-                    << "/trajLog_"
-                    << std::setfill('0')
-                    << std::setw(4)
-                    << (local_time.tm_year + 1900)
-                    << "-"
-                    << std::setw(2)
-                    << (local_time.tm_mon + 1)
-                    << "-"
-                    << std::setw(2)
-                    << local_time.tm_mday
-                    << "-"
-                    << std::setw(2)
-                    << local_time.tm_hour
-                    << "-"
-                    << std::setw(2)
-                    << local_time.tm_min
-                    << "-"
-                    << std::setw(2)
-                    << local_time.tm_sec
-                    << ".bin";
-
-
-                const std::string archive_filename =
-                    filename_stream.str();
 
 
                 /*
-                 * ------------------------------------------------
-                 * Write latest trajectory.
+                 * ========================================================
+                 * >>> TRAJECTORY COMPLETE CONDITION <<<
                  *
-                 * trajLog.bin is always overwritten.
-                 * ------------------------------------------------
-                 */
-
-                std::ofstream latest_file(
-                    LATEST_LOG_FILE,
-                    std::ios::binary |
-                    std::ios::trunc);
-
-                if (!latest_file)
-                {
-                    std::cerr
-                        << "[LOG] Failed to open "
-                        << LATEST_LOG_FILE
-                        << '\n';
-
-                    continue;
-                }
-
-
-                latest_file.write(
-                    reinterpret_cast<const char*>(
-                        trajectory_buffer.data()),
-                    static_cast<std::streamsize>(
-                        trajectory_buffer.size()));
-
-
-                if (!latest_file)
-                {
-                    std::cerr
-                        << "[LOG] Failed to write "
-                        << LATEST_LOG_FILE
-                        << '\n';
-
-                    continue;
-                }
-
-
-                latest_file.close();
-
-
-                /*
-                 * ------------------------------------------------
-                 * Write archived trajectory.
+                 * CURRENT TEST:
                  *
-                 * This file is never overwritten by the program
-                 * unless the exact same timestamp occurs.
-                 * ------------------------------------------------
+                 *     4 seconds elapsed.
+                 *
+                 * FUTURE:
+                 *
+                 *     Replace ONLY this condition with DONE command
+                 *     detection.
+                 *
+                 * IMPORTANT:
+                 *
+                 *     This check is performed AFTER the complete
+                 *     204-byte SPI transaction and after the packet
+                 *     has been stored.
+                 *
+                 *     If q was requested, the same file creation
+                 *     procedure is used for the final trajectory.
+                 * ========================================================
                  */
 
-                std::ofstream archive_file(
-                    archive_filename,
-                    std::ios::binary |
-                    std::ios::trunc);
-
-                if (!archive_file)
-                {
-                    std::cerr
-                        << "[LOG] Failed to open "
-                        << archive_filename
-                        << '\n';
-
-                    continue;
-                }
-
-
-                archive_file.write(
-                    reinterpret_cast<const char*>(
-                        trajectory_buffer.data()),
-                    static_cast<std::streamsize>(
-                        trajectory_buffer.size()));
-
-
-                if (!archive_file)
-                {
-                    std::cerr
-                        << "[LOG] Failed to write "
-                        << archive_filename
-                        << '\n';
-
-                    continue;
-                }
-
-
-                archive_file.close();
-
-
-                /*
-                 * ------------------------------------------------
-                 * File creation completed successfully.
-                 * ------------------------------------------------
-                 */
-
-                std::cout
-                    << "[LOG] Trajectory complete"
-                    << " | packets="
-                    << (trajectory_buffer.size() /
-                        TEST_DATA_SIZE)
-                    << " | bytes="
-                    << trajectory_buffer.size()
-                    << '\n';
-
-                std::cout
-                    << "[LOG] Latest   : "
-                    << LATEST_LOG_FILE
-                    << '\n';
-
-                std::cout
-                    << "[LOG] Archive  : "
-                    << archive_filename
-                    << '\n';
-
-
-                /*
-                 * Start collecting the next trajectory.
-                 */
-
-                trajectory_buffer.clear();
-
-                trajectory_start_time =
+                const auto trajectory_now =
                     std::chrono::steady_clock::now();
-            }
+
+                const bool trajectory_complete =
+                    ((trajectory_now -
+                      trajectory_start_time) >=
+                     TRAJECTORY_INTERVAL);
+
+                const bool final_exit =
+                    exit_requested;
 
 
-            /*
-             * ------------------------------------------------------------
-             * Periodic statistics
-             * ------------------------------------------------------------
-             *
-             * Print statistics once per second.
-             *
-             * IMPORTANT:
-             *
-             * Do NOT print one line for every SPI transaction.
-             * The target test rate is 1 packet/ms = 1000 packets/sec.
-             *
-             * Excessive terminal output can affect userspace timing and
-             * make the test result less representative of the actual
-             * GPIO -> SPI path.
-             */
+                if (trajectory_complete || final_exit)
+                {
+                    /*
+                     * ------------------------------------------------
+                     * Create timestamp for archived trajectory file.
+                     * ------------------------------------------------
+                     */
 
-            const auto report_now =
-                std::chrono::steady_clock::now();
+                    const std::time_t current_time =
+                        std::time(nullptr);
 
-            if ((report_now - last_report_time) >=
-                STAT_REPORT_INTERVAL)
-            {
-                const uint64_t rx_delta =
-                    spi_count - last_report_spi_count;
+                    std::tm local_time{};
 
-                const uint64_t spi_error_delta =
-                    spi_error_count -
-                    last_report_spi_error_count;
+                    if (localtime_r(
+                            &current_time,
+                            &local_time) == nullptr)
+                    {
+                        std::cerr
+                            << "[LOG] Failed to get local time\n";
 
-                const uint64_t sequence_error_delta =
-                    sequence_error_count -
-                    last_report_sequence_error_count;
-
-                const uint64_t missing_delta =
-                    missing_packet_count -
-                    last_report_missing_packet_count;
-
-                const uint64_t duplicate_delta =
-                    duplicate_packet_count -
-                    last_report_duplicate_packet_count;
+                        continue;
+                    }
 
 
-                std::cout
-                    << "[1s] "
-                    << "RX=" << rx_delta
-                    << " SPI_ERR=" << spi_error_delta
-                    << " SEQ_ERR=" << sequence_error_delta
-                    << " LOST=" << missing_delta
-                    << " DUP=" << duplicate_delta
-                    << '\n';
+                    std::ostringstream filename_stream;
+
+                    filename_stream
+                        << LOG_DIRECTORY
+                        << "/trajLog_"
+                        << std::setfill('0')
+                        << std::setw(4)
+                        << (local_time.tm_year + 1900)
+                        << "-"
+                        << std::setw(2)
+                        << (local_time.tm_mon + 1)
+                        << "-"
+                        << std::setw(2)
+                        << local_time.tm_mday
+                        << "-"
+                        << std::setw(2)
+                        << local_time.tm_hour
+                        << "-"
+                        << std::setw(2)
+                        << local_time.tm_min
+                        << "-"
+                        << std::setw(2)
+                        << local_time.tm_sec
+                        << ".bin";
 
 
-                last_report_spi_error_count =
-                    spi_error_count;
-
-                last_report_spi_count =
-                    spi_count;
-
-                last_report_sequence_error_count =
-                    sequence_error_count;
-
-                last_report_missing_packet_count =
-                    missing_packet_count;
-
-                last_report_duplicate_packet_count =
-                    duplicate_packet_count;
+                    const std::string archive_filename =
+                        filename_stream.str();
 
 
-                last_report_time =
-                    report_now;
+                    /*
+                     * ------------------------------------------------
+                     * Write latest trajectory.
+                     *
+                     * trajLog.bin is always overwritten.
+                     * ------------------------------------------------
+                     */
+
+                    std::ofstream latest_file(
+                        LATEST_LOG_FILE,
+                        std::ios::binary |
+                        std::ios::trunc);
+
+                    if (!latest_file)
+                    {
+                        std::cerr
+                            << "[LOG] Failed to open "
+                            << LATEST_LOG_FILE
+                            << '\n';
+
+                        continue;
+                    }
+
+
+                    latest_file.write(
+                        reinterpret_cast<const char*>(
+                            trajectory_buffer.data()),
+                        static_cast<std::streamsize>(
+                            trajectory_buffer.size()));
+
+
+                    if (!latest_file)
+                    {
+                        std::cerr
+                            << "[LOG] Failed to write "
+                            << LATEST_LOG_FILE
+                            << '\n';
+
+                        continue;
+                    }
+
+
+                    latest_file.close();
+
+
+                    /*
+                     * ------------------------------------------------
+                     * Write archived trajectory.
+                     * ------------------------------------------------
+                     */
+
+                    std::ofstream archive_file(
+                        archive_filename,
+                        std::ios::binary |
+                        std::ios::trunc);
+
+                    if (!archive_file)
+                    {
+                        std::cerr
+                            << "[LOG] Failed to open "
+                            << archive_filename
+                            << '\n';
+
+                        continue;
+                    }
+
+
+                    archive_file.write(
+                        reinterpret_cast<const char*>(
+                            trajectory_buffer.data()),
+                        static_cast<std::streamsize>(
+                            trajectory_buffer.size()));
+
+
+                    if (!archive_file)
+                    {
+                        std::cerr
+                            << "[LOG] Failed to write "
+                            << archive_filename
+                            << '\n';
+
+                        continue;
+                    }
+
+
+                    archive_file.close();
+
+
+                    /*
+                     * ------------------------------------------------
+                     * File creation completed successfully.
+                     * ------------------------------------------------
+                     */
+
+                    std::cout
+                        << "[LOG] Trajectory complete"
+                        << " | packets="
+                        << (trajectory_buffer.size() /
+                            TEST_DATA_SIZE)
+                        << " | bytes="
+                        << trajectory_buffer.size()
+                        << '\n';
+
+                    std::cout
+                        << "[LOG] Latest   : "
+                        << LATEST_LOG_FILE
+                        << '\n';
+
+                    std::cout
+                        << "[LOG] Archive  : "
+                        << archive_filename
+                        << '\n';
+
+
+                    /*
+                     * q exit:
+                     *
+                     * Both files are now complete.
+                     *
+                     * Only now is program termination allowed.
+                     */
+
+                    if (final_exit)
+                    {
+                        std::cout
+                            << "[EXIT] Final packet logged. "
+                            << "Program exiting.\n";
+
+                        break;
+                    }
+
+
+                    /*
+                     * Start collecting the next trajectory.
+                     */
+
+                    trajectory_buffer.clear();
+
+                    trajectory_start_time =
+                        std::chrono::steady_clock::now();
+                }
+
+
+                /*
+                 * ------------------------------------------------------------
+                 * Periodic statistics
+                 * ------------------------------------------------------------
+                 */
+
+                const auto report_now =
+                    std::chrono::steady_clock::now();
+
+                if ((report_now - last_report_time) >=
+                    STAT_REPORT_INTERVAL)
+                {
+                    const uint64_t rx_delta =
+                        spi_count -
+                        last_report_spi_count;
+
+                    const uint64_t spi_error_delta =
+                        spi_error_count -
+                        last_report_spi_error_count;
+
+                    const uint64_t sequence_error_delta =
+                        sequence_error_count -
+                        last_report_sequence_error_count;
+
+                    const uint64_t missing_delta =
+                        missing_packet_count -
+                        last_report_missing_packet_count;
+
+                    const uint64_t duplicate_delta =
+                        duplicate_packet_count -
+                        last_report_duplicate_packet_count;
+
+
+                    std::cout
+                        << "[1s] "
+                        << "RX=" << rx_delta
+                        << " SPI_ERR=" << spi_error_delta
+                        << " SEQ_ERR=" << sequence_error_delta
+                        << " LOST=" << missing_delta
+                        << " DUP=" << duplicate_delta
+                        << '\n';
+
+
+                    last_report_spi_error_count =
+                        spi_error_count;
+
+                    last_report_spi_count =
+                        spi_count;
+
+                    last_report_sequence_error_count =
+                        sequence_error_count;
+
+                    last_report_missing_packet_count =
+                        missing_packet_count;
+
+                    last_report_duplicate_packet_count =
+                        duplicate_packet_count;
+
+
+                    last_report_time =
+                        report_now;
+                }
             }
         }
         catch (const std::exception& e)
@@ -1071,8 +1183,22 @@ int main()
     }
 
 
+    /*
+     * Restore terminal settings before exiting.
+     */
+
+    if (terminal_modified)
+    {
+        tcsetattr(
+            STDIN_FILENO,
+            TCSANOW,
+            &original_terminal);
+    }
+
+
     gpiod_line_request_release(gpio_request);
     gpiod_chip_close(gpio_chip);
 
     return 0;
 }
+
