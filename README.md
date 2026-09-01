@@ -2871,3 +2871,653 @@ const bool trajectory_complete =
 這個條件即可；`q` 的正常離開機制不需要跟著改。
 
 有一點你測試時要特別注意：**按 `q` 後，如果 STM32 已經停止送 PE3，CM5 會繼續等待下一個 PE3 rising，這是刻意如此設計的，因為你的要求是「一定要收完最後完整一包並建立檔案後才離開」。**
+
+---
+
+今天這一階段已經完成，而且目前程式運行結果符合你的預期。下面這份提示詞你明天直接貼到新對話即可，我把**今天完成的架構、已驗證結果、不可破壞的部分，以及明天要進行的 DONE 命令解析設計**都整理進去了。
+
+# 明日新對話提示詞：CM5 SPI 接收 → Trajectory Log → DONE 命令解析
+
+你現在要延續我昨天完成的 STM32H755 SPI Slave → Raspberry Pi CM5 SPI Master 資料接收與 Trajectory Log 儲存工作。
+
+請先完整閱讀以下背景，不要重新設計已經驗證成功的 SPI 架構，也不要把已完成的部分重新做一次。
+
+---
+
+# 一、整體系統架構
+
+目前系統為：
+
+STM32H755 CM7
+→ SPI2 Slave
+→ Raspberry Pi CM5 SPI Master
+→ GPIO25 notification
+→ C++ userspace 程式
+→ 收集 204-byte packet
+→ 建立 Trajectory Log 檔案
+→ FTP Server 根目錄 `/srv/ftp/LOG`
+
+STM32H755 每 1 ms 產生一個資料點。
+
+每一個資料點固定：
+
+* 204 bytes
+* Byte 0~1：16-bit sequence number
+* Byte 2~203：EtherCAT application test data
+
+未來同事的 EtherCAT 程式會讓這 204 bytes 隨著每個軌跡點而改變。
+
+---
+
+# 二、STM32H755 SPI Slave 已經完成，現在暫時不要修改
+
+STM32H755 SPI Slave 這一階段已經完成並驗證成功。
+
+主要架構：
+
+* SPI2 Slave
+* PE3 作為通知 CM5 的 GPIO
+* CM5 GPIO25 接收 PE3 rising edge
+* CM5 收到 GPIO25 rising edge 後才啟動 SPI transaction
+* SPI 一次接收 204 bytes
+* STM32 使用 DMA / non-blocking 架構
+* Ring Buffer 架構已建立
+* `HM_SendPacket()` 是目前主要送資料 API
+
+STM32 端目前階段已經暫時結束，不要重新設計。
+
+---
+
+# 三、硬體波形已經確認
+
+之前曾經使用錯誤的 PF2/PF3 作為測試 GPIO，後來確認 STM32H755 開發板沒有這些腳位。
+
+最後改使用：
+
+* PE2：測試波形輸出
+* PE3：通知 CM5
+
+實際示波器量測結果：
+
+* PE2 HIGH 約 82 us
+* PE2 下降緣附近緊貼 PE3 上升緣
+* PE3 HIGH 約 0.24 ms
+
+這證明目前 STM32 → CM5 的 notification / SPI transaction timing 架構符合預期。
+
+---
+
+# 四、CM5 SPI Master 已經驗證成功
+
+目前 C++ 程式：
+
+`spi_master_irq_16byte_test.cpp`
+
+名稱雖然歷史上仍然叫 16byte_test，但實際目前已經是：
+
+* SPI receive size = 204 bytes
+* SPI mode = 0
+* SPI speed = 12 MHz
+* `/dev/spidev0.0`
+* GPIO chip = `/dev/gpiochip0`
+* GPIO line = 25
+* GPIO25 rising edge 觸發 SPI transaction
+
+SPI transaction 不是 timer polling。
+
+流程固定：
+
+STM32 PE3 HIGH
+→ CM5 GPIO25 rising edge
+→ C++ event wakeup
+→ SPI transaction
+→ 完整接收 204 bytes
+→ packet 儲存
+→ sequence verification
+→ trajectory condition 判斷
+
+這個架構已經成功運作。
+
+---
+
+# 五、目前已完成 Trajectory Log 功能
+
+目前 CM5 程式已經可以把收到的 204-byte packet 持續收集。
+
+因為：
+
+「一條 trajectory 的 point 數量不固定」
+
+所以沒有使用固定大小 buffer。
+
+目前使用：
+
+```cpp
+std::vector<uint8_t> trajectory_buffer;
+```
+
+並且：
+
+```cpp
+trajectory_buffer.reserve(
+    TEST_DATA_SIZE * 4096U);
+```
+
+這只是 initial allocation，不是最大容量。
+
+vector 必要時會自動成長。
+
+每收到一個完整 204-byte packet：
+
+```cpp
+trajectory_buffer.insert(
+    trajectory_buffer.end(),
+    rx_data,
+    rx_data + TEST_DATA_SIZE);
+```
+
+所以 buffer 中的資料格式就是：
+
+Packet 1
+
+* Packet 2
+* Packet 3
+* ...
+* Packet N
+
+總大小：
+
+`N × 204 bytes`
+
+因此可以支援不固定的 trajectory point 數量。
+
+---
+
+# 六、目前的 Trajectory 完成條件
+
+目前還沒有真正的命令解析程式。
+
+所以昨天先使用「時間」模擬 trajectory complete condition。
+
+目前：
+
+```cpp
+static constexpr auto TRAJECTORY_INTERVAL =
+    std::chrono::seconds(4);
+```
+
+意思是：
+
+每 4 秒把目前累積的 trajectory 視為完成。
+
+非常重要：
+
+條件判斷是在：
+
+**完整 204-byte SPI transaction 完成之後**
+
+才執行。
+
+也就是：
+
+GPIO25 rising
+→ SPI 接收 204 bytes
+→ transaction 完成
+→ packet 放入 trajectory_buffer
+→ sequence verification
+→ 檢查 trajectory complete condition
+→ 如果條件成立
+→ 建立檔案
+
+因此如果 4 秒到達時，SPI packet 正在傳輸：
+
+**不會中斷這個 packet。**
+
+一定會等完整 204 bytes 接收完成後，才建立 trajectory file。
+
+這個行為已經符合需求。
+
+---
+
+# 七、目前建立兩個檔案
+
+FTP Server LOG 目錄：
+
+```text
+/srv/ftp/LOG
+```
+
+不要建立任何額外子目錄。
+
+## 1. 最新 trajectory
+
+固定：
+
+```text
+/srv/ftp/LOG/trajLog.bin
+```
+
+每次 trajectory 完成：
+
+* 覆蓋舊檔
+* 寫入最新 trajectory
+* 因此永遠代表最新一筆 trajectory
+
+使用：
+
+```cpp
+std::ios::binary |
+std::ios::trunc
+```
+
+---
+
+## 2. 歷史 trajectory
+
+格式：
+
+```text
+trajLog_YYYY-MM-DD-HH-MM-SS.bin
+```
+
+例如：
+
+```text
+trajLog_2026-08-31-14-35-27.bin
+```
+
+這個檔案：
+
+* 每次 trajectory 完成建立一個新檔案
+* 不應該覆蓋之前的 trajectory
+* 用建立檔案時的 local time 命名
+
+---
+
+# 八、今天已經實際驗證成功
+
+目前程式實際運行符合期待：
+
+1. CM5 可以持續接收 STM32H755 的 204-byte packet
+2. GPIO25 rising edge 可以正常觸發 SPI transaction
+3. SPI 12 MHz 已經正常運作
+4. 204-byte packet 可以完整接收
+5. trajectory buffer 可以持續累積 packet
+6. 每 4 秒可以建立 trajectory file
+7. `trajLog.bin` 會更新為最新 trajectory
+8. timestamp archive file 可以保留歷史資料
+9. packet 傳輸中的情況，不會在 packet 中途建立檔案
+10. 必須先完成最後一個完整 packet，再進行 trajectory file creation
+11. 不固定 point 數量的需求已透過 dynamic vector 解決
+12. 程式正常運行結果符合目前測試需求
+
+所以：
+
+**SPI 接收架構與 Trajectory Logging 這一階段視為完成。**
+
+---
+
+# 九、目前又新增「q 離開程式」功能
+
+昨天另外完成一個需求：
+
+程式運行期間可以按：
+
+```text
+q
+```
+
+要求離開程式。
+
+但是：
+
+**不能因為按下 q 就立即離開。**
+
+正確行為：
+
+使用者按下 `q`
+→ 設定 exit request
+→ 不再接受新的 trajectory processing / 結束要求
+→ 如果目前沒有正在進行的 SPI transaction，仍然要確保目前最後完整 packet 的處理完成
+→ 如果 q 發生在 SPI packet 傳輸期間，必須等待 SPI transaction 完整結束
+→ 將最後完整 packet 放入 trajectory buffer
+→ 建立最後 trajectory file
+→ 完整寫入 `trajLog.bin`
+→ 完整寫入 timestamp archive file
+→ 確認 file creation 完成
+→ 才離開程式
+
+也就是：
+
+**q = request exit，不是立即 abort。**
+
+這個功能目前也已經實際運行符合期待。
+
+程式一開始的提示框已經加入 q 離開說明。
+
+---
+
+# 十、目前最重要的下一階段：真正的命令解析
+
+不要再修改 SPI 傳輸架構。
+
+下一階段要開始設計：
+
+**Command Parser / Command Server**
+
+目前使用 4 秒 timer：
+
+```cpp
+TRAJECTORY_INTERVAL
+```
+
+只是為了測試 trajectory file creation。
+
+真正產品需求不是「每 4 秒建檔」。
+
+真正需求是：
+
+同事的 EtherCAT 程式控制滑台。
+
+滑台每 1 ms 產生一個 trajectory point。
+
+每個 point = 204 bytes。
+
+當一整條 trajectory 完成時，同事的程式會送出：
+
+```text
+DONE
+```
+
+代表：
+
+**trajectory 已經形成，可以建立 trajectory log file。**
+
+因此未來流程應該變成：
+
+STM32H755
+→ 204-byte point
+→ CM5 SPI
+→ trajectory_buffer
+
+同時：
+
+同事的 command
+→ Command Parser
+→ 收到 `DONE`
+→ 設定 trajectory complete condition
+
+然後：
+
+下一個完整 SPI packet 接收完成
+→ 將 packet 放入 trajectory_buffer
+→ 檢查 DONE condition
+→ 建立：
+
+```text
+trajLog.bin
+```
+
+以及：
+
+```text
+trajLog_YYYY-MM-DD-HH-MM-SS.bin
+```
+
+---
+
+# 十一、非常重要的設計原則
+
+未來命令條件改變時：
+
+**只替換「Trajectory Complete Condition」相關部分。**
+
+不要修改：
+
+* SPI GPIO25 event detection
+* SPI transfer
+* 204-byte packet handling
+* sequence verification
+* trajectory_buffer
+* file writing
+* filename generation
+* q graceful shutdown
+* statistics
+
+理想架構：
+
+```text
+                    +----------------------+
+STM32 PE3 --------> | GPIO25 event         |
+                    +----------+-----------+
+                               |
+                               v
+                    +----------------------+
+                    | SPI Receive 204 bytes|
+                    +----------+-----------+
+                               |
+                               v
+                    +----------------------+
+                    | trajectory_buffer    |
+                    +----------+-----------+
+                               |
+                               v
+                    +----------------------+
+                    | Command / Condition  |
+                    |      CHECK           |
+                    +----------+-----------+
+                               |
+                         DONE received?
+                               |
+                              YES
+                               |
+                               v
+                    +----------------------+
+                    | Create trajectory    |
+                    | files                |
+                    +----------------------+
+```
+
+未來如果命令從：
+
+```text
+DONE
+```
+
+改成其他 protocol，例如：
+
+```text
+DONE\n
+```
+
+或：
+
+```text
+CMD:DONE
+```
+
+或 binary command，
+
+應該只需要修改 Command Parser / Condition 部分。
+
+---
+
+# 十二、明天第一個工作
+
+明天開始前，先不要直接大改程式。
+
+先分析目前 `spi_master_irq_16byte_test.cpp` 的結構，找出：
+
+1. 哪裡最適合加入 Command Parser
+2. Command Parser 是否應該獨立成 function
+3. 是否需要另外的 thread / non-blocking stdin / IPC
+4. `DONE` 到達時如何安全地通知主 SPI event loop
+5. 如何保證 DONE 不會破壞目前的 204-byte SPI transaction
+6. 如何保證 q graceful shutdown 與 DONE 不互相衝突
+7. 如何讓未來替換命令格式時，只修改 command parser
+
+目前不要為了 command parser 重新設計 SPI。
+
+---
+
+# 十三、特別注意：DONE 與 SPI packet 的時間關係
+
+這是明天設計時非常重要的問題。
+
+假設：
+
+SPI 正在傳送第 N 個 204-byte packet。
+
+同時收到：
+
+```text
+DONE
+```
+
+不能中斷第 N 個 packet。
+
+必須：
+
+```text
+完成第 N 個 SPI packet
+        ↓
+將第 N 個 packet 放入 buffer
+        ↓
+再確認 DONE condition
+        ↓
+建立 trajectory file
+```
+
+因此 trajectory file 永遠只能包含完整的 204-byte packet。
+
+不能產生：
+
+* 半個 packet
+* 被截斷的 packet
+* packet 傳輸中途建立檔案
+
+---
+
+# 十四、q 與 DONE 的優先順序
+
+明天設計 command parser 時也要考慮：
+
+### 情況 A
+
+收到：
+
+```text
+DONE
+```
+
+然後沒有 q：
+
+→ 完成 trajectory
+→ 建立兩個檔案
+→ 繼續等待下一條 trajectory
+
+### 情況 B
+
+使用者按：
+
+```text
+q
+```
+
+：
+
+→ request exit
+→ 完成最後正在進行的 SPI packet
+→ 將 packet 加入 buffer
+→ 建立最後 trajectory file
+→ 離開
+
+### 情況 C
+
+DONE 與 q 幾乎同時發生：
+
+必須設計 deterministic behavior。
+
+原則上：
+
+**完整 packet 優先完成，file creation 必須 atomic at application level，最後才離開。**
+
+明天需要針對這個情況討論並決定實際實作方式。
+
+---
+
+# 十五、不要忘記目前程式的測試條件
+
+目前測試：
+
+```cpp
+static constexpr uint32_t SPI_SPEED_HZ = 12000000U;
+```
+
+```cpp
+static constexpr size_t TEST_DATA_SIZE = 204U;
+```
+
+```text
+SPI Mode = 0
+GPIO25 = rising edge
+```
+
+這些都是目前已經驗證過的設定。
+
+**不要為了 Command Parser 而修改。**
+
+---
+
+# 十六、目前階段的目標
+
+現在已經完成：
+
+```text
+STM32H755 SPI Slave
+        ↓
+204-byte packet
+        ↓
+CM5 GPIO interrupt
+        ↓
+CM5 SPI Master
+        ↓
+204-byte receive
+        ↓
+dynamic trajectory buffer
+        ↓
+4-second test condition
+        ↓
+trajLog.bin
++
+trajLog_YYYY-MM-DD-HH-MM-SS.bin
+        ↓
+q graceful shutdown
+```
+
+明天要進入：
+
+```text
+                    ┌── SPI 204-byte data ──→ trajectory buffer
+                    │
+STM32H755 ──────────┤
+                    │
+                    └── Command ──→ Command Parser
+                                      │
+                                      ↓
+                                    DONE
+                                      │
+                                      ↓
+                              Trajectory Complete
+                                      │
+                                      ↓
+                              Create Log Files
+```
+
+最終目標：
+
+**把現在的「4 秒時間條件」乾淨地替換成「DONE 命令條件」，而其他已經驗證成功的 SPI、buffer、file、sequence verification、statistics、q graceful shutdown 全部保持不變。**
+
+請明天從「分析目前程式如何加入 Command Parser」開始，不要直接大幅修改。
+
+明天我們就從 **Command Parser 的介面與執行緒/事件模型**開始，先把「DONE 如何安全地進入目前 SPI event loop」設計清楚，再動程式。
