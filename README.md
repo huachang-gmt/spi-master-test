@@ -2296,3 +2296,578 @@ spidev
 在 2 MHz 已經可以穩定跑到約 1000 packet/s。
 
 > 「目前這套 STM32H755 SPI2 Slave + PE3 notification + CM5 spidev 架構，已實驗證明 2 MHz 穩定可靠、2.2 MHz 也可靠，而 2.5 MHz 已出現 sequence integrity failure。因此目前應將 2 MHz 視為保守且可靠的工作頻率，不再以提高 SPI clock 作為目前的優化方向。」
+
+---
+# [2026-08-31] 修改 檔案： spi_master_irq_16byte_test.cpp
+
+我的目標不是「每 4 秒固定產生一個固定大小的檔案」，而是先把**尚未完成軌跡的 204-byte packet 持續累積**，到了建檔條件後，在一個完整 packet 傳輸結束的邊界建立兩個檔案。
+
+我目前理解的設計如下：
+
+### 1. CM5 每 1 ms 收到一個 204-byte packet
+
+每個 packet：
+
+```text
+204 bytes
+```
+
+而且：
+
+* 每個 1 ms 的 point 內容可能不同
+* point 數量不固定
+* 因此一次軌跡的總資料量不固定
+* **不能預先假設檔案大小**
+
+### 2. 現階段用「4 秒」模擬 DONE
+
+暫時：
+
+```text
+每 4 秒觸發一次「準備建檔」
+```
+
+但有一個非常重要的規則：
+
+> **4 秒到了不能直接切檔，必須等目前正在進行的 SPI 204-byte packet 完整接收完成。**
+
+所以檔案切割點應該永遠落在：
+
+```text
+204-byte packet
+```
+
+的完整邊界。
+
+不能出現：
+
+```text
+前 100 bytes → 舊檔案
+後 104 bytes → 新檔案
+```
+
+### 3. 每次軌跡建立兩個檔案
+
+第一個：
+
+```text
+/srv/ftp/LOG/trajLog.bin
+```
+
+特性：
+
+* 永遠只有一份
+* 每次完成一個軌跡就覆蓋
+* 永遠代表**最新完成的軌跡**
+
+第二個：
+
+```text
+/srv/ftp/LOG/trajLog_%YYYY-%MM-%DD-%H-%M-%S.bin
+```
+
+例如：
+
+```text
+trajLog_2026-08-31-16-20-35.bin
+```
+
+特性：
+
+* 保存歷史軌跡
+* 不覆蓋舊資料
+* timestamp 使用**建立該軌跡檔案的時間**
+
+而且：
+
+```text
+/srv/ftp/LOG/
+```
+
+底下**不再建立任何子資料夾**。
+
+---
+
+### 4. Buffer 大小不應該設定成「固定最大檔案大小」
+
+這是你問題中非常重要的一點。
+
+我不建議：
+
+```cpp
+uint8_t buffer[某個固定大小];
+```
+
+因為你已經明確知道：
+
+> point 數量不固定 → 軌跡大小不固定。
+
+比較適合使用 **動態成長的 buffer / container**，例如：
+
+```cpp
+std::vector<uint8_t>
+```
+
+每收到一個完整的 204-byte packet：
+
+```text
+vector.push_back / insert
+```
+
+持續累積。
+
+例如：
+
+```text
+Point 1       204 bytes
+Point 2       204 bytes
+Point 3       204 bytes
+...
+Point N       204 bytes
+```
+
+最後：
+
+```text
+trajectory_buffer.size() = N × 204
+```
+
+因此完全不需要事先知道 N。
+
+### 5. 但我會特別注意記憶體使用
+
+這裡不能只是簡單地說「用 vector 就好了」。
+
+因為未來真正的軌跡可能很長，所以修改 CM5 程式時，我會讓設計符合：
+
+```text
+SPI receive
+    ↓
+完整 204-byte packet
+    ↓
+暫存目前軌跡
+    ↓
+DONE / 4 秒條件成立
+    ↓
+確認 packet 已完整接收
+    ↓
+建立 trajLog.bin
+    ↓
+建立 trajLog_YYYY-MM-DD-HH-MM-SS.bin
+```
+
+而不是讓檔案資料在 SPI 傳輸過程中被切斷。
+
+---
+
+### 6. 最重要的是：這只是現在的「4 秒測試版」
+
+我會把程式架構留成未來很容易替換：
+
+```text
+現在：
+4 秒 → 建檔
+
+未來：
+收到 "DONE" → 建檔
+```
+
+**但不新增另一個給同事呼叫的複雜介面。**
+
+未來同事的：
+
+```text
+DONE
+```
+
+進入命令解析程式後，只需要觸發相同的「trajectory complete」流程即可。
+
+---
+
+這次我建議**不要改動已經驗證成功的 GPIO25 → SPI 204 Byte 接收流程**。只在 SPI transaction 成功完成之後，把收到的 204 Byte 放進「目前軌跡暫存 buffer」，然後判斷是否到了建檔條件。
+
+### 我會採用這個架構
+
+```text
+STM32 PE3 HIGH
+       ↓
+CM5 GPIO25 RISING
+       ↓
+SPI Receive 204 Byte
+       ↓
+SPI transaction 完成
+       ↓
+加入 trajectory_buffer
+       ↓
+【建檔條件】
+目前暫定：累積時間 >= 4 秒
+       ↓
+建檔
+ ┌───────────────┬─────────────────────────────┐
+ │ trajLog.bin   │ trajLog_YYYY-MM-DD-HH-MM-SS │
+ │ 覆蓋          │ 永久保存                     │
+ └───────────────┴─────────────────────────────┘
+       ↓
+清空 trajectory_buffer
+       ↓
+開始收下一條軌跡
+```
+
+而且有一個很重要的地方：
+
+> **4 秒到了，不會中斷 SPI。**
+
+因為我們會在 `spi.Transfer()` 完成、204 Byte 已經完整收到並放入 buffer 後，才判斷 4 秒條件。因此你要求的「如果 4 秒剛好在 packet 傳輸中，等待 packet 完成」自然成立。
+
+---
+
+## Buffer 怎麼設計？
+
+這裡不應該寫死例如：
+
+```cpp
+uint8_t buffer[1MB];
+```
+
+因為你已經明確說了：
+
+> 點數不固定，所以軌跡檔案大小不固定。
+
+因此 CM5 使用：
+
+```cpp
+std::vector<uint8_t> trajectory_buffer;
+```
+
+每收到一個 204 Byte：
+
+```text
+trajectory_buffer
+    ↓
+append 204 bytes
+```
+
+它會自動擴充。
+
+例如：
+
+```text
+1000 points → 204,000 bytes
+2000 points → 408,000 bytes
+5000 points → 1,020,000 bytes
+```
+
+不需要事先知道點數。
+
+而且我會讓 buffer **只儲存完整的 204-byte packet**，不會產生半個 packet。
+
+---
+
+# 這次修改的位置
+
+我會改 **4 個地方**：
+
+### ① Include 區域
+
+增加：
+
+```cpp
+#include <fstream>
+#include <ctime>
+#include <vector>
+```
+
+---
+
+### ② Configuration 區域
+
+加入：
+
+```cpp
+static constexpr const char* LOG_DIRECTORY = "/srv/ftp/LOG";
+static constexpr auto TRAJECTORY_INTERVAL =
+    std::chrono::seconds(4);
+```
+
+並且用非常醒目的區塊標示：
+
+```cpp
+/* ============================================================
+ * >>> TRAJECTORY COMPLETE CONDITION <<<
+ *
+ * CURRENT TEST CONDITION:
+ *     4 seconds
+ *
+ * FUTURE:
+ *     Replace this condition with DONE command detection.
+ * ============================================================ */
+```
+
+**未來同事的 `DONE` command 做好後，只需要替換這個條件判斷，不需要修改 SPI 接收、buffer、建檔邏輯。**
+
+---
+
+### ③ Main event loop 裡 SPI 收到資料後
+
+原本：
+
+```cpp
+++spi_count;
+```
+
+之後直接做 sequence verification。
+
+我會在這裡加入：
+
+```text
+rx_data
+   ↓
+trajectory_buffer.insert(...)
+   ↓
+判斷 4 秒
+   ↓
+如果完成 → 建立兩個檔案
+```
+
+---
+
+### ④ 增加檔案建立函式
+
+這個函式只負責：
+
+* `trajLog.bin` 覆蓋寫入
+* `trajLog_YYYY-MM-DD-HH-MM-SS.bin` 保存
+* 寫入完整 trajectory buffer
+* 寫檔成功後清除 buffer
+
+它**不是給你同事呼叫的 API**，只是 CM5 程式內部 implementation。
+
+---
+
+## 最重要的一點
+
+目前這個程式的：
+
+```cpp
+GPIO25 RISING
+        ↓
+SPI transfer 204 bytes
+```
+
+我**不會改**。
+
+你之前已經花很多時間驗證：
+
+```text
+12 MHz
+204 bytes
+約 1000 packet/sec
+SPI_ERR=0
+SEQ_ERR=0
+LOST=0
+DUP=0
+```
+
+所以這一段現在是我們的**已驗證基礎**。
+
+這次只是在它後面增加：
+
+```text
+「資料收到了」
+       ↓
+「把資料暫存」
+       ↓
+「軌跡完成了嗎？」
+       ↓
+「建檔」
+```
+
+這樣最安全。
+
+---
+
+### 修改重點
+
+1. `std::vector<uint8_t>` 作為軌跡暫存 buffer，不限制固定檔案大小。
+2. 每成功收到一個完整 204-byte packet，就 append 到 buffer。
+3. **只有 SPI transfer 完成後才檢查 4 秒條件**，因此不會切斷 packet。
+4. 4 秒條件成立後：
+
+   * `/srv/ftp/LOG/trajLog.bin`：覆蓋
+   * `/srv/ftp/LOG/trajLog_YYYY-MM-DD-HH-MM-SS.bin`：永久保存
+5. 建檔完成後清空 buffer，開始下一個 4 秒收集週期。
+6. 原本 sequence verification 完全保留。
+7. 原本 1 秒統計輸出完全保留。
+
+### 有一個地方要特別注意
+
+目前：
+
+```cpp
+trajectory_buffer.insert(...)
+```
+
+是在 **SPI 完整成功後**才執行，因此每筆都是完整的 204 Byte。
+
+例如 4 秒期間收到：
+
+```text
+1001 packets
+```
+
+那麼檔案大小就是：
+
+```text
+1001 × 204 = 204204 bytes
+```
+
+下一次可能是 1002 packets：
+
+```text
+1002 × 204 = 204408 bytes
+```
+
+**完全不需要預先知道點數。**
+
+而：
+
+```cpp
+trajectory_buffer.reserve(TEST_DATA_SIZE * 4096U);
+```
+
+只是先預留約 800 KiB 的容量，**不是檔案大小限制**。如果超過，`std::vector` 會自動擴充。
+
+---
+
+還有一個設計上的細節：目前 4 秒是從程式進入軌跡收集階段開始計算，而**真正切檔一定發生在某一個完整 204-byte packet 收到之後**。所以它不是「4.000 秒硬切」，而是「4 秒到了之後，等下一個完整 packet 完成再切」，這正符合你要求的行為。
+
+---
+## 添加 q 按鍵 按下後跳離程式執行
+
+增加 **`q` 的正常離開機制**：
+
+1. 程式一開始提示：
+   `Press 'q' to exit after the current/final complete packet is received and logged.`
+
+2. 按下 `q` 後：
+
+   * 不直接 `break`
+   * 如果當下 SPI 正在傳輸，讓 `SPI Transfer()` 完整結束
+   * 完整 204 bytes 放入 `trajectory_buffer`
+   * 建立：
+
+     * `/srv/ftp/LOG/trajLog.bin`
+     * `/srv/ftp/LOG/trajLog_YYYY-MM-DD-HH-MM-SS.bin`
+   * **兩個檔案都成功建立後才離開**
+   * 如果 `q` 是在兩個 packet 之間按下，則已經收到的最後完整 packet 就是最後一包，直接建立檔案後離開
+   * 如果 `q` 按下時目前還沒有收到任何 packet，則繼續等待下一個 PE3 rising，收到完整 204 bytes 後才建檔並離開。
+
+3. `q` 的偵測不會改變原本：
+   **PE3 rising → SPI 204 bytes → buffer**
+   的核心流程。
+
+4. 原本的 **4 秒條件完全保留**，未來改成 `DONE` 時，仍然只需要修改你已經指定的：
+   `>>> TRAJECTORY COMPLETE CONDITION <<<`
+   區域。
+
+5. 我會把修改位置明確標示，例如：
+
+   * `// [MOD-1] q exit support`
+   * `// [MOD-2] q exit input handling`
+   * `// [MOD-3] graceful exit after final packet`
+
+另外有一個重要的實作細節：**不能單純讓程式卡在原本的 `gpiod_line_request_wait_edge_events(..., -1)`**，否則使用者按 `q` 時，如果 PE3 沒有下一個 rising edge，程式根本沒有機會知道 `q` 被按下。
+
+因此這次會把「等待 PE3」改成同時等待：
+
+* GPIO25 event
+* 標準輸入 `stdin`
+
+而 **SPI 傳輸本身完全不改**。
+
+這樣才能真正做到你要求的「運行中按 `q` 正常離開」，又不破壞目前已驗證成功的 SPI 接收架構。
+
+
+核心做法是：
+
+* `PE3 rising` 仍然是 SPI transaction 的唯一資料觸發來源。
+* `q` 只負責設定「要求離開」旗標。
+* `q` 不會中斷正在進行的 SPI transaction。
+* 如果 `q` 按下時沒有 packet，程式會繼續等待下一個完整 204-byte packet。
+* 收到最後完整 packet 後，一定先建立兩個檔案，再離開。
+* 終端機使用非 canonical 模式，所以**直接按 `q` 不需要 Enter**。
+* `q` 的處理與未來 `DONE` 條件完全分開，未來換掉 4 秒條件時不需要改 `q` 離開機制。
+
+### 修改位置
+
+共 4 個主要修改：
+
+1. **Include 區域**：加入 `<poll.h>`、`<termios.h>`
+2. **Configuration 後面**：加入終端機輸入設定與 `q` 狀態
+3. **初始化 GPIO/SPI 後**：設定 stdin 為即時讀取 `q`
+4. **Main event loop**：將原本永久等待 GPIO 的方式改成同時等待 GPIO25 與鍵盤；`q` 發生後仍完成最後一包並建檔。
+
+### 這次最重要的行為
+
+現在程式啟動後，會同時等待兩件事情：
+
+```text
+                    ┌── GPIO25 RISING ──→ SPI 204 bytes
+                    │
+CM5 event loop ─────┤
+                    │
+                    └── keyboard 'q' ──→ exit_requested = true
+```
+
+假設正在正常接收：
+
+```text
+PE3 ↑
+  ↓
+SPI 204 bytes
+  ↓
+加入 trajectory_buffer
+  ↓
+檢查 4 秒 / q
+  ↓
+建立 trajLog.bin
+  ↓
+建立 trajLog_YYYY-MM-DD-HH-MM-SS.bin
+```
+
+如果使用者在中間按 `q`：
+
+```text
+q
+↓
+exit_requested = true
+↓
+不立即離開
+↓
+等待下一個 PE3 ↑
+↓
+SPI 完整 204 bytes
+↓
+加入 buffer
+↓
+建立兩個檔案
+↓
+兩個檔案完成
+↓
+程式退出
+```
+
+**因此 `q` 不會造成半包資料，也不會在 SPI transaction 中途退出。**
+
+另外我特別保留了你原本的 **4 秒條件區塊**，未來同事的 `DONE` 命令做好之後，只需要替換：
+
+```cpp
+const bool trajectory_complete =
+    ((trajectory_now -
+      trajectory_start_time) >=
+     TRAJECTORY_INTERVAL);
+```
+
+這個條件即可；`q` 的正常離開機制不需要跟著改。
+
+有一點你測試時要特別注意：**按 `q` 後，如果 STM32 已經停止送 PE3，CM5 會繼續等待下一個 PE3 rising，這是刻意如此設計的，因為你的要求是「一定要收完最後完整一包並建立檔案後才離開」。**
