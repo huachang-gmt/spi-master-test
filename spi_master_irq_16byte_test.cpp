@@ -1,6 +1,7 @@
 #include <gpiod.h>
 #include <linux/spi/spidev.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,8 @@
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
@@ -95,32 +98,8 @@ static constexpr const char* LOG_DIRECTORY = "/srv/ftp/LOG";
 static constexpr const char* LATEST_LOG_FILE =
     "/srv/ftp/LOG/trajLog.bin";
 
-
-/*
- * ============================================================
- * >>> TRAJECTORY COMPLETE CONDITION <<<
- *
- * CURRENT TEST CONDITION:
- *
- *     Every 4 seconds, the currently collected trajectory
- *     is considered complete.
- *
- * FUTURE:
- *
- *     Replace this condition with DONE command detection.
- *
- * IMPORTANT:
- *
- *     The condition is checked ONLY AFTER one complete
- *     204-byte SPI packet has been received.
- *
- *     Therefore a packet being transferred when the
- *     4-second boundary occurs will always be completed
- *     before file creation starts.
- * ============================================================
- */
-static constexpr auto TRAJECTORY_INTERVAL =
-    std::chrono::seconds(4);
+static constexpr const char* TRAJECTORY_SOCKET_PATH =
+    "/tmp/gmt_trajectory.sock";
 
 
 /* ------------------------------------------------------------
@@ -265,6 +244,127 @@ private:
 
     int fd_ = -1;
 };
+
+
+/*
+ * Save one complete trajectory to latest and archive files.
+ * Returns true only when both files are written successfully.
+ */
+static bool SaveTrajectory(
+    const std::vector<uint8_t>& trajectory_buffer)
+{
+    if (trajectory_buffer.empty())
+    {
+        std::cerr << "[LOG] Cannot save empty trajectory\n";
+        return false;
+    }
+
+    const std::time_t current_time = std::time(nullptr);
+    std::tm local_time{};
+
+    if (localtime_r(&current_time, &local_time) == nullptr)
+    {
+        std::cerr << "[LOG] Failed to get local time\n";
+        return false;
+    }
+
+    std::ostringstream filename_stream;
+
+    filename_stream
+        << LOG_DIRECTORY
+        << "/trajLog_"
+        << std::setfill('0')
+        << std::setw(4) << (local_time.tm_year + 1900)
+        << "-"
+        << std::setw(2) << (local_time.tm_mon + 1)
+        << "-"
+        << std::setw(2) << local_time.tm_mday
+        << "-"
+        << std::setw(2) << local_time.tm_hour
+        << "-"
+        << std::setw(2) << local_time.tm_min
+        << "-"
+        << std::setw(2) << local_time.tm_sec
+        << ".bin";
+
+    const std::string archive_filename = filename_stream.str();
+
+    /*
+     * Write latest trajectory.
+     */
+    std::ofstream latest_file(
+        LATEST_LOG_FILE,
+        std::ios::binary | std::ios::trunc);
+
+    if (!latest_file)
+    {
+        std::cerr
+            << "[LOG] Failed to open "
+            << LATEST_LOG_FILE << '\n';
+        return false;
+    }
+
+    latest_file.write(
+        reinterpret_cast<const char*>(trajectory_buffer.data()),
+        static_cast<std::streamsize>(trajectory_buffer.size()));
+
+    latest_file.close();
+
+    if (!latest_file)
+    {
+        std::cerr
+            << "[LOG] Failed to write "
+            << LATEST_LOG_FILE << '\n';
+        return false;
+    }
+
+    /*
+     * Write archived trajectory.
+     */
+    std::ofstream archive_file(
+        archive_filename,
+        std::ios::binary | std::ios::trunc);
+
+    if (!archive_file)
+    {
+        std::cerr
+            << "[LOG] Failed to open "
+            << archive_filename << '\n';
+        return false;
+    }
+
+    archive_file.write(
+        reinterpret_cast<const char*>(trajectory_buffer.data()),
+        static_cast<std::streamsize>(trajectory_buffer.size()));
+
+    archive_file.close();
+
+    if (!archive_file)
+    {
+        std::cerr
+            << "[LOG] Failed to write "
+            << archive_filename << '\n';
+        return false;
+    }
+
+    std::cout
+        << "[LOG] Trajectory saved"
+        << " | packets="
+        << (trajectory_buffer.size() / TEST_DATA_SIZE)
+        << " | bytes=" << trajectory_buffer.size()
+        << '\n';
+
+    std::cout
+        << "[LOG] Latest  : "
+        << LATEST_LOG_FILE << '\n';
+
+    std::cout
+        << "[LOG] Archive : "
+        << archive_filename << '\n';
+
+    return true;
+}
+
 
 
 /* ------------------------------------------------------------
@@ -510,6 +610,8 @@ int main()
     }
 
     bool exit_requested = false;
+    int trajectory_client_fd = -1;
+    std::string socket_command_buffer;
 
 
     /*
@@ -536,14 +638,6 @@ int main()
      */
     trajectory_buffer.reserve(
         TEST_DATA_SIZE * 4096U);
-
-
-    /*
-     * Start timing for the current trajectory.
-     */
-
-    auto trajectory_start_time =
-        std::chrono::steady_clock::now();
 
 
     /*
@@ -620,6 +714,64 @@ int main()
 
 
     /*
+     * Create Unix Domain Socket server.
+     */
+    const int trajectory_socket_fd =
+        socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (trajectory_socket_fd < 0)
+    {
+        std::cerr << "[UDS] Failed to create socket\n";
+        gpiod_line_request_release(gpio_request);
+        gpiod_chip_close(gpio_chip);
+        return 1;
+    }
+
+    struct sockaddr_un socket_address{};
+    socket_address.sun_family = AF_UNIX;
+
+    std::strncpy(
+        socket_address.sun_path,
+        TRAJECTORY_SOCKET_PATH,
+        sizeof(socket_address.sun_path) - 1);
+
+    if (bind(
+            trajectory_socket_fd,
+            reinterpret_cast<const struct sockaddr*>(
+                &socket_address),
+            sizeof(socket_address)) < 0)
+    {
+        std::cerr
+            << "[UDS] Failed to bind "
+            << TRAJECTORY_SOCKET_PATH
+            << ": " << std::strerror(errno) << '\n';
+
+        close(trajectory_socket_fd);
+        gpiod_line_request_release(gpio_request);
+        gpiod_chip_close(gpio_chip);
+        return 1;
+    }
+
+    if (listen(trajectory_socket_fd, 4) < 0)
+    {
+        std::cerr
+            << "[UDS] Failed to listen: "
+            << std::strerror(errno) << '\n';
+
+        close(trajectory_socket_fd);
+        unlink(TRAJECTORY_SOCKET_PATH);
+        gpiod_line_request_release(gpio_request);
+        gpiod_chip_close(gpio_chip);
+        return 1;
+    }
+
+    std::cout
+        << "[UDS] Listening on "
+        << TRAJECTORY_SOCKET_PATH
+        << '\n';
+
+
+    /*
      * --------------------------------------------------------
      * Main event loop
      * --------------------------------------------------------
@@ -637,13 +789,19 @@ int main()
     {
         try
         {
-            struct pollfd poll_fds[2]{};
+            struct pollfd poll_fds[4]{};
 
             poll_fds[0].fd = gpio_fd;
             poll_fds[0].events = POLLIN;
 
             poll_fds[1].fd = STDIN_FILENO;
             poll_fds[1].events = POLLIN;
+
+            poll_fds[2].fd = trajectory_socket_fd;
+            poll_fds[2].events = POLLIN;
+
+            poll_fds[3].fd = trajectory_client_fd;
+            poll_fds[3].events = POLLIN;
 
             /*
              * Wait indefinitely for GPIO25 or keyboard input.
@@ -652,7 +810,7 @@ int main()
             const int poll_result =
                 poll(
                     poll_fds,
-                    2,
+                    4,
                     -1);
 
             if (poll_result < 0)
@@ -877,218 +1035,15 @@ int main()
 
 
                 /*
-                 * ========================================================
-                 * >>> TRAJECTORY COMPLETE CONDITION <<<
-                 *
-                 * CURRENT TEST:
-                 *
-                 *     4 seconds elapsed.
-                 *
-                 * FUTURE:
-                 *
-                 *     Replace ONLY this condition with DONE command
-                 *     detection.
-                 *
-                 * IMPORTANT:
-                 *
-                 *     This check is performed AFTER the complete
-                 *     204-byte SPI transaction and after the packet
-                 *     has been stored.
-                 *
-                 *     If q was requested, the same file creation
-                 *     procedure is used for the final trajectory.
-                 * ========================================================
-                 */
+                * Save only when q requests final exit.
+                * UDS save requests are handled separately.
+                */
+                const bool final_exit = exit_requested;
 
-                const auto trajectory_now =
-                    std::chrono::steady_clock::now();
-
-                const bool trajectory_complete =
-                    ((trajectory_now -
-                      trajectory_start_time) >=
-                     TRAJECTORY_INTERVAL);
-
-                const bool final_exit =
-                    exit_requested;
-
-
-                if (trajectory_complete || final_exit)
+                if (final_exit)
                 {
-                    /*
-                     * ------------------------------------------------
-                     * Create timestamp for archived trajectory file.
-                     * ------------------------------------------------
-                     */
 
-                    const std::time_t current_time =
-                        std::time(nullptr);
-
-                    std::tm local_time{};
-
-                    if (localtime_r(
-                            &current_time,
-                            &local_time) == nullptr)
-                    {
-                        std::cerr
-                            << "[LOG] Failed to get local time\n";
-
-                        continue;
-                    }
-
-
-                    std::ostringstream filename_stream;
-
-                    filename_stream
-                        << LOG_DIRECTORY
-                        << "/trajLog_"
-                        << std::setfill('0')
-                        << std::setw(4)
-                        << (local_time.tm_year + 1900)
-                        << "-"
-                        << std::setw(2)
-                        << (local_time.tm_mon + 1)
-                        << "-"
-                        << std::setw(2)
-                        << local_time.tm_mday
-                        << "-"
-                        << std::setw(2)
-                        << local_time.tm_hour
-                        << "-"
-                        << std::setw(2)
-                        << local_time.tm_min
-                        << "-"
-                        << std::setw(2)
-                        << local_time.tm_sec
-                        << ".bin";
-
-
-                    const std::string archive_filename =
-                        filename_stream.str();
-
-
-                    /*
-                     * ------------------------------------------------
-                     * Write latest trajectory.
-                     *
-                     * trajLog.bin is always overwritten.
-                     * ------------------------------------------------
-                     */
-
-                    std::ofstream latest_file(
-                        LATEST_LOG_FILE,
-                        std::ios::binary |
-                        std::ios::trunc);
-
-                    if (!latest_file)
-                    {
-                        std::cerr
-                            << "[LOG] Failed to open "
-                            << LATEST_LOG_FILE
-                            << '\n';
-
-                        continue;
-                    }
-
-
-                    latest_file.write(
-                        reinterpret_cast<const char*>(
-                            trajectory_buffer.data()),
-                        static_cast<std::streamsize>(
-                            trajectory_buffer.size()));
-
-
-                    if (!latest_file)
-                    {
-                        std::cerr
-                            << "[LOG] Failed to write "
-                            << LATEST_LOG_FILE
-                            << '\n';
-
-                        continue;
-                    }
-
-
-                    latest_file.close();
-
-
-                    /*
-                     * ------------------------------------------------
-                     * Write archived trajectory.
-                     * ------------------------------------------------
-                     */
-
-                    std::ofstream archive_file(
-                        archive_filename,
-                        std::ios::binary |
-                        std::ios::trunc);
-
-                    if (!archive_file)
-                    {
-                        std::cerr
-                            << "[LOG] Failed to open "
-                            << archive_filename
-                            << '\n';
-
-                        continue;
-                    }
-
-
-                    archive_file.write(
-                        reinterpret_cast<const char*>(
-                            trajectory_buffer.data()),
-                        static_cast<std::streamsize>(
-                            trajectory_buffer.size()));
-
-
-                    if (!archive_file)
-                    {
-                        std::cerr
-                            << "[LOG] Failed to write "
-                            << archive_filename
-                            << '\n';
-
-                        continue;
-                    }
-
-
-                    archive_file.close();
-
-
-                    /*
-                     * ------------------------------------------------
-                     * File creation completed successfully.
-                     * ------------------------------------------------
-                     */
-
-                    std::cout
-                        << "[LOG] Trajectory complete"
-                        << " | packets="
-                        << (trajectory_buffer.size() /
-                            TEST_DATA_SIZE)
-                        << " | bytes="
-                        << trajectory_buffer.size()
-                        << '\n';
-
-                    std::cout
-                        << "[LOG] Latest   : "
-                        << LATEST_LOG_FILE
-                        << '\n';
-
-                    std::cout
-                        << "[LOG] Archive  : "
-                        << archive_filename
-                        << '\n';
-
-
-                    /*
-                     * q exit:
-                     *
-                     * Both files are now complete.
-                     *
-                     * Only now is program termination allowed.
-                     */
-
-                    if (final_exit)
+                    if (SaveTrajectory(trajectory_buffer))
                     {
                         std::cout
                             << "[EXIT] Final packet logged. "
@@ -1097,15 +1052,12 @@ int main()
                         break;
                     }
 
-
                     /*
-                     * Start collecting the next trajectory.
-                     */
+                    * Save failed. Keep the buffer and retry
+                    * after the next complete SPI packet.
+                    */
 
-                    trajectory_buffer.clear();
 
-                    trajectory_start_time =
-                        std::chrono::steady_clock::now();
                 }
 
 
@@ -1172,6 +1124,135 @@ int main()
                         report_now;
                 }
             }
+
+
+            /*
+            * Accept one UDS client.
+            */
+            if (poll_fds[2].revents & POLLIN)
+            {
+                const int accepted_fd =
+                    accept(trajectory_socket_fd, nullptr, nullptr);
+
+                if (accepted_fd >= 0)
+                {
+                    if (trajectory_client_fd >= 0)
+                    {
+                        const char busy_response[] = "SAVE_ERROR\n";
+
+                        send(
+                            accepted_fd,
+                            busy_response,
+                            sizeof(busy_response) - 1,
+                            MSG_NOSIGNAL);
+
+                        close(accepted_fd);
+                    }
+                    else
+                    {
+                        trajectory_client_fd = accepted_fd;
+                        socket_command_buffer.clear();
+                    }
+                }
+            }
+
+            /*
+            * Receive a UDS command without blocking GPIO processing.
+            */
+            if (trajectory_client_fd >= 0 &&
+                (poll_fds[3].revents &
+                (POLLIN | POLLHUP | POLLERR)))
+            {
+                bool close_client = false;
+                bool command_complete = false;
+
+                if (poll_fds[3].revents & POLLIN)
+                {
+                    char rx_buffer[64];
+
+                    const ssize_t received =
+                        recv(
+                            trajectory_client_fd,
+                            rx_buffer,
+                            sizeof(rx_buffer),
+                            MSG_DONTWAIT);
+
+                    if (received > 0)
+                    {
+                        socket_command_buffer.append(
+                            rx_buffer,
+                            static_cast<std::size_t>(received));
+
+                        if (socket_command_buffer.size() > 128U)
+                        {
+                            close_client = true;
+                        }
+                        else if (socket_command_buffer.find('\n') !=
+                                std::string::npos)
+                        {
+                            command_complete = true;
+                        }
+                    }
+                    else if (received == 0)
+                    {
+                        close_client = true;
+                    }
+                    else if (errno != EAGAIN &&
+                            errno != EWOULDBLOCK &&
+                            errno != EINTR)
+                    {
+                        close_client = true;
+                    }
+                }
+
+                if (command_complete)
+                {
+                    const std::string expected_command =
+                        "SAVE_TRAJECTORY\n";
+
+                    const bool valid_command =
+                        socket_command_buffer == expected_command;
+
+                    bool save_ok = false;
+
+                    if (valid_command)
+                    {
+                        save_ok = SaveTrajectory(trajectory_buffer);
+
+                        if (save_ok)
+                        {
+                            trajectory_buffer.clear();
+                        }
+                    }
+
+                    const char* response =
+                        save_ok ? "SAVE_OK\n" : "SAVE_ERROR\n";
+
+                    const std::size_t response_length =
+                        std::strlen(response);
+
+                    send(
+                        trajectory_client_fd,
+                        response,
+                        response_length,
+                        MSG_NOSIGNAL);
+
+                    close_client = true;
+                }
+
+                if (poll_fds[3].revents & (POLLHUP | POLLERR))
+                {
+                    close_client = true;
+                }
+
+                if (close_client)
+                {
+                    close(trajectory_client_fd);
+                    trajectory_client_fd = -1;
+                    socket_command_buffer.clear();
+                }
+            }
+
         }
         catch (const std::exception& e)
         {
@@ -1195,6 +1276,17 @@ int main()
             &original_terminal);
     }
 
+    /*
+     * Close UDS client socket.
+     */
+    if (trajectory_client_fd >= 0)
+    {
+        close(trajectory_client_fd);
+        trajectory_client_fd = -1;
+    }
+
+    close(trajectory_socket_fd);
+    unlink(TRAJECTORY_SOCKET_PATH);
 
     gpiod_line_request_release(gpio_request);
     gpiod_chip_close(gpio_chip);

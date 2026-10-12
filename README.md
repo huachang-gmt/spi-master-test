@@ -3518,6 +3518,362 @@ STM32H755 ──────────┤
 
 **把現在的「4 秒時間條件」乾淨地替換成「DONE 命令條件」，而其他已經驗證成功的 SPI、buffer、file、sequence verification、statistics、q graceful shutdown 全部保持不變。**
 
-請明天從「分析目前程式如何加入 Command Parser」開始，不要直接大幅修改。
+# [2026-10-12] 更新
 
-明天我們就從 **Command Parser 的介面與執行緒/事件模型**開始，先把「DONE 如何安全地進入目前 SPI event loop」設計清楚，再動程式。
+```
+          【第一階段：CM5 啟動】
+
+CM5 開機
+   │
+   ▼
+啟動 SPI Master 接收程式
+   │
+   ├── 初始化 SPI Master
+   ├── 設定 GPIO25 上升沿偵測
+   └── 進入等待狀態
+           │
+           │ 此時 STM32H755 尚未啟動
+           ▼
+      等待 GPIO25 上升沿
+           │
+           │
+          【第二階段：STM32 啟動】
+
+STM32H755 開機
+   │
+   ▼
+初始化 SPI Slave 與 GPIO
+   │
+   ▼
+開始每 1ms 準備／傳送一筆資料
+   │
+   ▼
+GPIO 輸出上升沿
+   │
+   ▼
+CM5 偵測 GPIO25 上升沿
+   │
+   ▼
+CM5 SPI Master 開始傳輸
+   │
+   ▼
+接收 204 Bytes
+   │
+   ▼
+等待下一次 GPIO 上升沿
+   │
+   └────────────── 每 1ms 重複
+```
+
+```
+PC
+└── GMT Command Client（Qt）
+        │
+        │ TCP :9999
+        ▼
+CM5
+└── GMT_Command_Gateway
+        │
+        ├── USB CDC
+        │     │
+        │     ▼
+        │   STM32H755
+        │     │
+        │     └── 執行運動命令
+        │
+        └── UDS Client
+              │
+              │ /tmp/gmt_trajectory.sock
+              │ SAVE_TRAJECTORY\n
+              ▼
+        spi-master-test
+              │
+              ├── 接收 STM32H755 的 SPI 軌跡資料
+              ├── 寫入 trajLog.bin
+              ├── 建立時間戳記封存檔
+              └── 回覆 SAVE_OK\n 或 SAVE_ERROR\n
+```
+
+```
+1. Qt Client 傳送運動命令
+          │
+          ▼
+2. Gateway 將命令傳送給 STM32H755
+          │
+          ▼
+3. STM32H755 執行運動
+          │
+          ▼
+4. STM32H755 回覆真正的 DONE
+          │
+          ▼
+5. Gateway 將 DONE 回覆給 Qt Client
+          │
+          ▼
+6. Gateway 傳送 SAVE_TRAJECTORY\n
+   給 spi-master-test
+          │
+          ▼
+7. spi-master-test 執行存檔
+          │
+          ▼
+8. spi-master-test 回覆 SAVE_OK\n
+   或 SAVE_ERROR\n
+```
+
+
+# SPI Master Test — STM32H755 Trajectory Logging
+
+## 1. Overview
+
+This project runs on a Raspberry Pi Compute Module 5 (CM5) and receives trajectory data from an STM32H755 microcontroller through SPI.
+
+The CM5 acts as the SPI Master, while the STM32H755 acts as the SPI Slave.
+
+The STM32H755 generates a GPIO trigger signal to notify the CM5 when SPI data should be retrieved. The CM5 detects the rising edge of GPIO25 and performs an SPI transfer to receive one trajectory packet.
+
+The project also provides a Unix Domain Socket (UDS) interface that allows another local application, such as `GMT_Command_Gateway`, to request trajectory data to be saved to disk.
+
+## 2. System Architecture
+
+```text
+STM32H755
+    |
+    | GPIO rising edge
+    | SPI Slave: 204-byte trajectory packet
+    v
+Raspberry Pi CM5
+    |
+    +-- GPIO25 rising-edge detection
+    |
+    +-- SPI Master
+    |      |
+    |      +-- Receive trajectory packets
+    |      +-- Append received data to memory buffer
+    |
+    +-- UDS Server
+           |
+           | /tmp/gmt_trajectory.sock
+           |
+           +-- Receive SAVE_TRAJECTORY command
+           +-- Save trajectory data
+           +-- Return SAVE_OK or SAVE_ERROR
+```
+
+## 3. Hardware and Software
+
+### Hardware
+
+* Raspberry Pi Compute Module 5 (CM5)
+* STM32H755 microcontroller board
+* SPI connection between CM5 and STM32H755
+* GPIO25 trigger connection
+
+### Software
+
+* Linux on Raspberry Pi CM5
+* C++17
+* Linux SPI userspace interface (`spidev`)
+* Linux GPIO character-device interface through `libgpiod`
+* Unix Domain Socket (AF_UNIX)
+
+## 4. SPI Configuration
+
+| Parameter     | Configuration               |
+| ------------- | --------------------------- |
+| SPI device    | `/dev/spidev0.0`            |
+| SPI role      | CM5 Master, STM32H755 Slave |
+| SPI mode      | Mode 0                      |
+| Bits per word | 8                           |
+| SPI clock     | 12 MHz                      |
+| Packet size   | 204 bytes                   |
+| GPIO trigger  | GPIO25                      |
+| Trigger edge  | Rising edge                 |
+
+GPIO25 is the trigger for SPI data retrieval.
+
+The CM5 waits for a GPIO25 rising edge and then performs one SPI transfer to retrieve a 204-byte packet.
+
+The STM32H755 must generate the trigger signal according to the established hardware and firmware protocol.
+
+## 5. Startup Sequence
+
+The intended startup sequence is:
+
+1. Start the CM5 and run `spi_master_irq_16byte_test`.
+2. Confirm that the application has initialized SPI and GPIO monitoring and is listening on the UDS socket.
+3. Power on the STM32H755.
+4. The STM32H755 begins generating GPIO trigger events and providing SPI data.
+5. The CM5 receives trajectory packets and appends them to its in-memory trajectory buffer.
+
+This startup sequence was tested on the actual hardware.
+
+The CM5 was started before the STM32H755. After the STM32H755 was powered on without manually pressing RESET, the production application received trajectory packets successfully.
+
+## 6. UDS Interface
+
+### Socket Path
+
+```text
+/tmp/gmt_trajectory.sock
+```
+
+### Save Command
+
+The client sends the following command through the Unix Domain Socket:
+
+```text
+SAVE_TRAJECTORY\n
+```
+
+The command is sent as ASCII bytes, including the terminating newline character.
+
+### Responses
+
+| Response       | Meaning                                                               |
+| -------------- | --------------------------------------------------------------------- |
+| `SAVE_OK\n`    | The save operation completed successfully                             |
+| `SAVE_ERROR\n` | The save operation failed or no trajectory data was available to save |
+
+The client should read and check the response instead of assuming that sending the command means the save operation succeeded.
+
+The UDS server is intended for local inter-process communication on the CM5. It is not a network TCP service.
+
+## 7. Trajectory Log Files
+
+Log directory:
+
+```text
+/srv/ftp/LOG
+```
+
+Latest trajectory log:
+
+```text
+/srv/ftp/LOG/trajLog.bin
+```
+
+Timestamped archive naming pattern:
+
+```text
+/srv/ftp/LOG/trajLog_YYYY-MM-DD-HH-MM-SS.bin
+```
+
+After a successful save, the application writes the trajectory data to the latest log and creates a timestamped archive.
+
+The in-memory trajectory buffer is cleared after a successful save so that subsequent trajectory data can be collected for another save operation.
+
+An empty trajectory buffer must not cause existing log files to be overwritten.
+
+## 8. Hardware Verification Results
+
+The following tests were completed on the actual CM5 and STM32H755 hardware.
+
+| Test                                                               | Result |
+| ------------------------------------------------------------------ | ------ |
+| Start CM5 before STM32H755                                         | PASS   |
+| Power on STM32H755 without manually pressing RESET                 | PASS   |
+| Detect GPIO25 rising edges                                         | PASS   |
+| Receive 204-byte SPI packets                                       | PASS   |
+| Receive rate approximately 1,000 packets per second                | PASS   |
+| SPI error counter remained at zero during the reported test        | PASS   |
+| Sequence error counter remained at zero during the reported test   | PASS   |
+| Lost packet counter remained at zero during the reported test      | PASS   |
+| Duplicate packet counter remained at zero during the reported test | PASS   |
+| Connect to the UDS server from a separate local process            | PASS   |
+| Send `SAVE_TRAJECTORY\n`                                           | PASS   |
+| Receive `SAVE_OK\n`                                                | PASS   |
+| Create `trajLog.bin`                                               | PASS   |
+| Create timestamped archive                                         | PASS   |
+| Verify latest log and archive contents using SHA-256               | PASS   |
+
+### Verified Save Operation
+
+The following files were verified after a successful save on 2026-10-12.
+
+Latest log:
+
+```text
+trajLog.bin
+Size: 48,565,872 bytes
+SHA-256: bf7a6d222ad177067106d42b2893a8f11ec45ec3e972492554be8da0cf185a29
+```
+
+Timestamped archive:
+
+```text
+trajLog_2026-10-12-16-14-18.bin
+Size: 48,565,872 bytes
+SHA-256: bf7a6d222ad177067106d42b2893a8f11ec45ec3e972492554be8da0cf185a29
+```
+
+The file sizes and SHA-256 hashes matched, confirming that both files contained identical data for this test.
+
+These values describe the verified test run; they are not expected to remain the same in future runs.
+
+## 9. Independent SPI Diagnostic Test
+
+An independent diagnostic program, `spi_stm32_rx_test`, was created to test GPIO-triggered SPI reception separately from the production application.
+
+The diagnostic program:
+
+* Monitors GPIO25 rising edges.
+* Performs one 204-byte SPI transfer for each detected edge.
+* Reports received byte counts and packet samples.
+* Reports GPIO edge, successful transfer, and SPI error counters.
+* Does not write trajectory log files.
+* Does not use the UDS save interface.
+* Does not modify the production application's source code.
+
+The diagnostic test confirmed that the CM5 could receive SPI data when the CM5 was started first and the STM32H755 was powered on afterward.
+
+**Important:** The diagnostic program and production application both request GPIO25. Do not run them simultaneously.
+
+## 10. Important Operational Notes
+
+* Start the CM5 application before powering on the STM32H755.
+* GPIO25 rising edges trigger SPI transfers.
+* Do not run the independent diagnostic program concurrently with the production application.
+* Do not issue another save command until the previous save operation has completed.
+* A successful save clears the in-memory trajectory buffer.
+* Verify the returned UDS response before treating a save as successful.
+* Preserve existing trajectory logs unless there is an explicit reason to replace or delete them.
+
+## 11. Integration Status
+
+The SPI reception and UDS save functionality have passed the described hardware tests.
+
+The next integration stage is to connect `GMT_Command_Gateway` to the UDS server.
+
+The intended responsibility split is:
+
+* `GMT_Command_Gateway`: decides when to request trajectory data to be saved.
+* `spi_master_irq_16byte_test`: receives SPI data, stores trajectory data, and performs the file-save operation.
+
+Gateway-triggered saving, including handling `SAVE_OK` and `SAVE_ERROR`, must be verified separately.
+
+## 12. Main Application
+
+Production application source:
+
+```text
+spi_master_irq_16byte_test.cpp
+```
+
+Production executable:
+
+```text
+spi_master_irq_16byte_test
+```
+
+Independent diagnostic source:
+
+```text
+spi_stm32_rx_test.cpp
+```
+
+Independent diagnostic executable:
+
+```text
+spi_stm32_rx_test
+```
