@@ -669,11 +669,11 @@ int main()
      * ------------------------------------------------------------
      */
 
-    uint64_t last_report_spi_count = 0;
-    uint64_t last_report_spi_error_count = 0;
-    uint64_t last_report_sequence_error_count = 0;
-    uint64_t last_report_missing_packet_count = 0;
-    uint64_t last_report_duplicate_packet_count = 0;
+//    uint64_t last_report_spi_count = 0;  // 在 console 列印數據使用的變數
+//    uint64_t last_report_spi_error_count = 0; // 在 console 列印數據使用的變數
+//    uint64_t last_report_sequence_error_count = 0; // 在 console 列印數據使用的變數
+//    uint64_t last_report_missing_packet_count = 0; // 在 console 列印數據使用的變數
+//    uint64_t last_report_duplicate_packet_count = 0; // 在 console 列印數據使用的變數
 
     auto last_report_time =
         std::chrono::steady_clock::now();
@@ -1073,6 +1073,7 @@ int main()
                 if ((report_now - last_report_time) >=
                     STAT_REPORT_INTERVAL)
                 {
+/*
                     const uint64_t rx_delta =
                         spi_count -
                         last_report_spi_count;
@@ -1092,8 +1093,8 @@ int main()
                     const uint64_t duplicate_delta =
                         duplicate_packet_count -
                         last_report_duplicate_packet_count;
-
-
+*/
+/*    移除在 console 逐行列印
                     std::cout
                         << "[1s] "
                         << "RX=" << rx_delta
@@ -1102,8 +1103,8 @@ int main()
                         << " LOST=" << missing_delta
                         << " DUP=" << duplicate_delta
                         << '\n';
-
-
+*/
+/*
                     last_report_spi_error_count =
                         spi_error_count;
 
@@ -1118,7 +1119,7 @@ int main()
 
                     last_report_duplicate_packet_count =
                         duplicate_packet_count;
-
+*/
 
                     last_report_time =
                         report_now;
